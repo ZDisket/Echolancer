@@ -1,0 +1,40 @@
+# Test model configuration (tiny model for VRAM efficiency)
+model:
+  name: "echolancer"
+  vocab_size: 50
+  mel_channels: 40
+  emotion_channels: 64
+  speaker_channels: 16
+  multi_speaker: False
+  n_speaker: 1
+  use_alibi: True
+  alibi_alpha: 1.0
+  activation: "relu"
+  encoder:
+    hidden: 64
+    head: 2
+    layer: 2
+    dropout: 0.1
+    forward_expansion: 2
+  decoder:
+    hidden: 64
+    head: 2
+    layer: 2
+    dropout: 0.1
+
+# Test preprocessing configuration
+preprocessing:
+  text:
+    text_cleaners: ["english_cleaners"]
+  mel:
+    n_mel_channels: 40
+  audio:
+    sampling_rate: 22050
+    max_wav_value: 32768.0
+
+# Test dataset configuration
+dataset:
+  name: "dummy"
+  path: "./test_data"
+  train_file: "train.txt"
+  val_file: "val.txt"
