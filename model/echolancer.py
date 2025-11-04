@@ -514,26 +514,22 @@ class MultiHeadAttention(nn.Module):
         ])
         return slopes
 
-    def _get_alibi_bias(self, seq_len_q, seq_len_k):
+    def _get_alibi_bias(self, seq_len_q: int, seq_len_k: int, *, device=None, dtype=torch.float32):
         """
-        Generate ALiBi attention bias matrix.
+        Returns additive ALiBi bias of shape (1, H, Tq, Tk) in fp32.
+        Uses bias[q,k] = slope_h * (k - q), which is <= 0 on/left of the diagonal (causal region).
         """
-        # Create position indices
-        q_indices = torch.arange(seq_len_q, device=self.alibi_slopes.device).unsqueeze(1)  # (seq_len_q, 1)
-        k_indices = torch.arange(seq_len_k, device=self.alibi_slopes.device).unsqueeze(0)  # (1, seq_len_k)
-        
-        # Calculate position differences
-        relative_positions = q_indices - k_indices  # (seq_len_q, seq_len_k)
-        
-        # Expand to (num_heads, seq_len_q, seq_len_k)
-        relative_positions = relative_positions.unsqueeze(0).expand(
-            self.num_heads, seq_len_q, seq_len_k
-        )
-        
-        # Apply slopes
-        alibi_bias = self.alibi_slopes.unsqueeze(1).unsqueeze(2) * relative_positions
-        
-        return alibi_bias  # (num_heads, seq_len_q, seq_len_k)
+        device = device if device is not None else next(self.parameters()).device
+
+        # per-head slopes (H,)
+        slopes = self.alibi_slopes.view(1, self.num_heads, 1, 1).to(dtype=torch.float32)  # (1,H,1,1)
+
+        # positions
+        q_idx = torch.arange(seq_len_q, device=device, dtype=dtype).view(1, 1, seq_len_q, 1)
+        k_idx = torch.arange(seq_len_k, device=device, dtype=dtype).view(1, 1, 1, seq_len_k)
+
+        bias = slopes * (k_idx - q_idx)  # (1,H,Tq,Tk), typically <= 0 on/left of diagonal
+        return bias  # fp32
 
     def forward(self, query, key, value, mask=None):
         batch_size = query.size(0)
@@ -567,44 +563,68 @@ class MultiHeadAttention(nn.Module):
         return x
 
     def _forward_manual(self, K, Q, V, batch_size, mask, seq_len_k, seq_len_q):
-        # Repeat K and V for grouped query attention
-        # Each KV head is repeated num_query_groups times
+        """
+        Q,K,V shape assumption: (B, Hq/Hk, T, Dh) *before* this call.
+        mask: expected shape (B, 1, Tq, Tk) with 1/True = keep, 0/False = block.
+        """
+        B = batch_size
+        device = Q.device
+        # Ensure tensors are the same dtype
+        d_k = Q.size(-1)
+
+        # ---- GQA expansion (repeat KV to match query heads) ----
         if self.num_kv_heads != self.num_heads:
-            # Repeat K and V to match the number of query heads
-            K = K.repeat_interleave(self.num_query_groups, dim=1)
-            V = V.repeat_interleave(self.num_query_groups, dim=1)
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.d_k)
-        # Add ALiBi bias if enabled
+            K = K.repeat_interleave(self.num_query_groups, dim=1)  # (B, H, Tk, Dh)
+            V = V.repeat_interleave(self.num_query_groups, dim=1)  # (B, H, Tk, Dh)
+
+        # ---- Scaled dot-product scores in fp32 ----
+        # (B, H, Tq, Dh) @ (B, H, Dh, Tk) -> (B, H, Tq, Tk)
+        scores = torch.matmul(Q, K.transpose(-2, -1))
+        scale = 1.0 / (d_k ** 0.5)
+        scores = (scores * scale).float()  # upcast for numerical stability
+
+        # ---- ALiBi (additive bias) ----
         if self.use_alibi:
+            # Build (1, H, Tq, Tk) and expand to (B, H, Tq, Tk)
             alibi_bias = self._get_alibi_bias(seq_len_q, seq_len_k)
-            alibi_bias = alibi_bias.unsqueeze(0)  # Add batch dimension
-            scores = scores + alibi_bias
+            # _get_alibi_bias should already return shape (1, H, Tq, Tk); expand to batch
+            if alibi_bias.dim() == 4 and alibi_bias.size(0) == 1:
+                alibi_bias = alibi_bias.expand(B, -1, -1, -1)
+            scores = scores + alibi_bias  # still fp32
+
+        # ---- External mask (additive -inf where blocked) ----
         if mask is not None:
-            # Ensure mask has the right shape for broadcasting with scores
-            # scores: (batch_size, num_heads, seq_len_q, seq_len_k)
-            # mask should be: (batch_size, 1, seq_len_q, seq_len_k) to broadcast to all heads
-            if mask.dim() != 4:
-                raise ValueError(f"Mask must have shape (batch_size, 1, seq_len_q, seq_len_k), got shape {mask.size()}")
-
+            # Expect mask shape (B, 1, Tq, Tk); True/1=keep, False/0=block
+            if mask.dim() != 4 or mask.size(0) != B or mask.size(2) != seq_len_q or mask.size(3) != seq_len_k:
+                raise ValueError(f"Mask must be (B,1,Tq,Tk); got {tuple(mask.size())}")
             if mask.size(1) != 1:
-                raise ValueError(f"Second dim (head) of mask must equal 1 for all-heads broadcast, but got size {mask.size(1)}")
+                raise ValueError(f"Mask head dim must be 1 for broadcast; got {mask.size(1)}")
 
-            scores = scores.masked_fill(mask == 0, -1e9)
+            if mask.dtype != torch.bool:
+                # Treat nonzero as keep
+                mask_bool = mask != 0
+            else:
+                mask_bool = mask
 
+            neg_inf = torch.finfo(torch.float32).min
+            scores = scores.masked_fill(~mask_bool, neg_inf)
+
+        # ---- Causal mask (if you don't already encode causality in 'mask') ----
         if self.causal:
-            causal_mask = torch.tril(
-                torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=scores.device),
-                diagonal=0,
-            ).unsqueeze(0).unsqueeze(0)  # (Tq, Tk) -> (1, 1, Tq, Tk)
-            scores = scores.masked_fill(causal_mask == 0, -1e9)
+            # Causal over (Tq, Tk)
+            causal = torch.ones((seq_len_q, seq_len_k), device=device, dtype=torch.bool).tril()
+            causal = causal.view(1, 1, seq_len_q, seq_len_k)  # (1,1,Tq,Tk)
+            neg_inf = torch.finfo(torch.float32).min
+            scores = scores.masked_fill(~causal, neg_inf)
 
-        attention = F.softmax(scores, dim=-1)
-        attention = self.dropout(attention)
-        # Apply attention to values
-        x = torch.matmul(attention, V)
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        # Output projection
+        # ---- Softmax in fp32, then cast back ----
+        attn = torch.softmax(scores, dim=-1)
+        attn = attn.to(Q.dtype)
+        attn = self.dropout(attn)
+
+        # ---- Attention apply ----
+        x = torch.matmul(attn, V)  # (B,H,Tq,Dh)
+        x = x.transpose(1, 2).contiguous().view(B, -1, self.d_model)  # (B,Tq,H*Dh)
         x = self.W_o(x)
         return x
 

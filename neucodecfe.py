@@ -19,9 +19,10 @@ class NeuCodecFE():
         self.model = DistillNeuCodec.from_pretrained(model_name)
         self.is_cuda = is_cuda
         self.offset = offset
+        self.device = torch.device("cuda" if is_cuda else "cpu")
 
-        device = torch.device("cuda" if is_cuda else "cpu")
-        self.model = self.model.to(device)
+
+        self.model = self.model.to(self.device)
         self.model.eval()  # Set to evaluation mode
 
         print(f"Loaded NeuCodec model: {model_name} (CUDA: {is_cuda})")
@@ -51,6 +52,7 @@ class NeuCodecFE():
           torch.Tensor: Reconstructed audio tensor of shape (B, 1, T_audio)
         """
         with torch.no_grad():
+            codes = codes.to(self.device)
             codes = codes - self.offset
             reconstructed_audio = self.model.decode_code(codes)
         return reconstructed_audio
