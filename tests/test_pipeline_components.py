@@ -16,7 +16,7 @@ class MockBERTFrontEnd:
     def __init__(self, is_cuda=False, model_name="answerdotai/ModernBERT-base"):
         self.is_cuda = is_cuda
         self.model_name = model_name
-        print(f"Mock BERTFrontEnd initialized with {model_name}")
+        print(f"Mock EmbeddingFE initialized with {model_name}")
     
     def infer(self, text):
         """Mock inference method."""
@@ -32,37 +32,35 @@ class MockBERTFrontEnd:
             
         return encoded_layers, pooled
 
-class MockScriptedPreEncoder:
-    """Mock scripted pre-encoder for testing."""
-    def __init__(self, model_dir, device='cpu'):
-        self.device = torch.device(device)
-        self.config = {'model': {'mel_channels': 40}}
-        print(f"Mock ScriptedPreEncoder initialized on {device}")
+class MockNeuCodecFE:
+    """Mock neural audio codec frontend for testing."""
+    def __init__(self, is_cuda=False, model_name="neuphonic/distill-neucodec"):
+        self.is_cuda = is_cuda
+        self.model_name = model_name
+        self.sampling_rate = 24000
+        print(f"Mock NeuCodecFE initialized with {model_name}")
     
-    @property
-    def mel_channels(self):
-        return self.config['model']['mel_channels']
+    def encode_audio(self, audio_tensor):
+        """Mock audio encoding method."""
+        # Return mock discrete codes
+        batch_size, channels, audio_len = audio_tensor.shape
+        code_len = audio_len // 100  # Simplified length conversion
+        codes = torch.randint(0, 1024, (batch_size, channels, code_len))
+        return codes
     
-    def decode(self, indices, lengths=None):
-        """Mock decode method."""
-        batch_size, seq_len = indices.shape[:2]
-        mel_channels = self.mel_channels
-        spectrogram = torch.randn(batch_size, seq_len, mel_channels)
-        return spectrogram.to(self.device)
-
-class MockISTFTNetFE:
-    """Mock ISTFTNet frontend for testing."""
-    def __init__(self, gen=None, stft=None):
-        self.sampling_rate = 22050
-        print("Mock ISTFTNetFE initialized")
+    def decode_codes(self, codes):
+        """Mock codes decoding method."""
+        # Return mock reconstructed audio
+        batch_size, channels, code_len = codes.shape
+        audio_len = code_len * 100  # Simplified length conversion
+        audio = torch.randn(batch_size, channels, audio_len)
+        return audio
     
-    def infer(self, x):
+    def infer(self, audio_tensor):
         """Mock inference method."""
-        # Return mock audio waveform
-        batch_size, seq_len = x.shape[:2]
-        audio_len = seq_len * 256  # Assuming 256 hop size
-        audio = torch.randn(batch_size, audio_len)
-        return audio.numpy()
+        codes = self.encode_audio(audio_tensor)
+        reconstructed = self.decode_codes(codes)
+        return reconstructed
 
 class TestPipelineComponents(unittest.TestCase):
     def setUp(self):
@@ -94,39 +92,30 @@ class TestPipelineComponents(unittest.TestCase):
             self.assertEqual(pooled_gpu.device.type, 'cuda')
             print("  MockBERTFrontEnd (GPU): PASSED")
     
-    def test_mock_scripted_preencoder(self):
-        """Test mock scripted pre-encoder."""
-        print("Testing MockScriptedPreEncoder...")
+    def test_mock_neucodec_fe(self):
+        """Test mock NeuCodec frontend."""
+        print("Testing MockNeuCodecFE...")
         
         # Test CPU version
-        preenc_cpu = MockScriptedPreEncoder('.', device='cpu')
-        indices = torch.randint(0, 1000, (1, 50, 8))  # (batch, seq_len, quantizers)
-        spectrogram = preenc_cpu.decode(indices)
+        neucodec_cpu = MockNeuCodecFE(is_cuda=False)
+        audio = torch.randn(1, 1, 24000)  # (batch, channels, samples) - 1 second at 24kHz
+        codes = neucodec_cpu.encode_audio(audio)
+        reconstructed = neucodec_cpu.decode_codes(codes)
         
-        self.assertIsInstance(spectrogram, torch.Tensor)
-        self.assertEqual(spectrogram.shape, (1, 50, 40))  # (batch, seq_len, mel_channels)
-        print("  MockScriptedPreEncoder (CPU): PASSED")
+        self.assertIsInstance(codes, torch.Tensor)
+        self.assertIsInstance(reconstructed, torch.Tensor)
+        print("  MockNeuCodecFE (CPU): PASSED")
         
         # Test GPU version if available
         if torch.cuda.is_available():
-            preenc_gpu = MockScriptedPreEncoder('.', device='cuda')
-            indices_gpu = indices.cuda()
-            spectrogram_gpu = preenc_gpu.decode(indices_gpu)
+            neucodec_gpu = MockNeuCodecFE(is_cuda=True)
+            audio_gpu = audio.cuda()
+            codes_gpu = neucodec_gpu.encode_audio(audio_gpu)
+            reconstructed_gpu = neucodec_gpu.decode_codes(codes_gpu)
             
-            self.assertEqual(spectrogram_gpu.device.type, 'cuda')
-            print("  MockScriptedPreEncoder (GPU): PASSED")
-    
-    def test_mock_istftnet_fe(self):
-        """Test mock ISTFTNet frontend."""
-        print("Testing MockISTFTNetFE...")
-        
-        istftnet = MockISTFTNetFE()
-        spectrogram = torch.randn(1, 100, 40)  # (batch, seq_len, mel_channels)
-        audio = istftnet.infer(spectrogram)
-        
-        self.assertIsInstance(audio, np.ndarray)
-        self.assertEqual(audio.shape, (1, 100 * 256))  # Assuming 256 hop size
-        print("  MockISTFTNetFE: PASSED")
+            self.assertEqual(codes_gpu.device.type, 'cuda')
+            self.assertEqual(reconstructed_gpu.device.type, 'cuda')
+            print("  MockNeuCodecFE (GPU): PASSED")
     
     def test_pipeline_integration(self):
         """Test integration of all pipeline components."""
@@ -134,8 +123,7 @@ class TestPipelineComponents(unittest.TestCase):
         
         # Initialize all components
         bert_model = MockBERTFrontEnd(is_cuda=(self.device.type == 'cuda'))
-        pre_encoder = MockScriptedPreEncoder('.', device=self.device)
-        istftnet = MockISTFTNetFE()
+        neucodec_fe = MockNeuCodecFE(is_cuda=(self.device.type == 'cuda'))
         
         # Test sentences
         test_sentences = ["This is a test sentence.", "Another example."]
@@ -146,28 +134,27 @@ class TestPipelineComponents(unittest.TestCase):
             # Step 1: Get emotion encoding from BERT
             em_blocks, em_hidden = bert_model.infer(sentence)
             
-            # Step 2: Generate tokens with mock Echolancer model
+            # Step 2: Generate discrete audio codes with mock Echolancer model
             seq_len = len(sentence.split())
             token_ids = torch.randint(0, 1000, (1, seq_len))  # Mock token IDs
             
-            # Step 3: Decode indices to spectrogram
-            indices = torch.randint(0, 1000, (1, seq_len, 8))  # Mock indices
-            spectrogram = pre_encoder.decode(indices)
+            # Step 3: Generate mock discrete audio codes
+            codes = torch.randint(0, 1024, (1, 1, seq_len * 10))  # Mock discrete audio codes
             
-            # Step 4: Convert spectrogram to audio
-            audio = istftnet.infer(spectrogram)
+            # Step 4: Convert discrete codes to audio using NeuCodec
+            audio = neucodec_fe.decode_codes(codes)
             
             # Verify outputs
             self.assertIsInstance(em_blocks, torch.Tensor)
             self.assertIsInstance(em_hidden, torch.Tensor)
-            self.assertIsInstance(spectrogram, torch.Tensor)
-            self.assertIsInstance(audio, np.ndarray)
+            self.assertIsInstance(codes, torch.Tensor)
+            self.assertIsInstance(audio, torch.Tensor)
             
             # Check shapes
             self.assertEqual(em_blocks.shape[1], seq_len)  # Same as word count
             self.assertEqual(em_hidden.shape[1], 768)  # BERT hidden size
-            self.assertEqual(spectrogram.shape[1], seq_len)  # Same sequence length
-            self.assertEqual(audio.shape[1], seq_len * 256)  # Assuming 256 hop size
+            self.assertEqual(codes.shape[0], 1)  # Batch size
+            self.assertEqual(audio.shape[0], 1)  # Batch size
         
         print("  Pipeline integration: PASSED")
 

@@ -33,7 +33,8 @@ class CharTokenizer:
             'pad': '<PAD>',
             'unk': '<UNK>',
             'bos': '<BOS>',  # Beginning of sequence
-            'eos': '<EOS>'   # End of sequence
+            'eos': '<EOS>',   # End of sequence
+            'mask': '[MASK]' # Mask token for MLM
         }
         
         # Build fixed vocabulary with English lowercase letters and speech-relevant punctuation
@@ -111,7 +112,7 @@ class CharTokenizer:
 
 
     
-    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> List[int]:
+    def encode(self, text: str, add_bos: bool = True, add_eos: bool = True) -> List[int]:
         """
         Convert text to a list of indices.
         

@@ -1,0 +1,43 @@
+# Pretraining configuration for Echolancer
+
+# Pretraining-specific parameters
+pretraining:
+  # Data configuration
+  text_chunk_length: 256
+  vq_chunk_length: 512
+  mask_fraction: 0.15
+
+  # Training configuration
+  log_interval: 10
+  save_interval_steps: 1000  # Changed from save_interval which used epochs
+  val_interval_steps: 500    # New: validation interval in steps
+  max_val_steps: 50
+  val_split_ratio: 0.01      # 1% for validation by default
+  max_val_samples: 2500      # Maximum 2500 samples in validation
+
+  # Output settings
+  output_dir: "pretrain_checkpoints"
+  
+# Testing configuration
+testing:
+  test_interval_steps: 1000  # New: test interval in steps
+  n_test_audios: 10          # Number of test audios to generate
+  
+# Override or add any pretraining-specific training parameters
+training:
+  epochs: 10
+  batch_size: 16
+
+# Override or add any pretraining-specific model parameters if needed
+model:
+  # Pretraining mode specific settings
+  pretraining_mode: True
+  multi_speaker: False  # Use simpler speaker handling for pretraining
+  n_speaker: 0
+
+# Override or add any pretraining-specific model parameters if needed
+model:
+  # Pretraining mode specific settings
+  pretraining_mode: True
+  multi_speaker: False  # Use simpler speaker handling for pretraining
+  n_speaker: 0

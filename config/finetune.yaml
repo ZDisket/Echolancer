@@ -1,5 +1,5 @@
 # Training configuration
-mixed_precision: "none"  # Options: "fp16", "bf16", "none"
+mixed_precision: "none"  # Options: "fp16", "bf16", "fp8", "none". None will still use TF32 for speed, if the hardware supports it.
 
 # torch.compile configuration
 enable_torch_compile: false  # Whether to use torch.compile for performance
@@ -10,32 +10,34 @@ torch_compile_args:  # Arguments for torch.compile (only used if enable_torch_co
 
 # Hardware specifications
 gpu_flops: 1307400000000000  # GPU FLOPs (default to 1302k TFLOPs, example for MI300X)
-
+freeze_to: 0 # Freeze down to last N transformer layers
 optimizer:
   type: "adamw"
-  learning_rate: 0.0001
+  learning_rate: 0.00001
   weight_decay: 0.01
-  eps: 1e-06
+  eps: 0.000001
   betas: [0.9, 0.98]
-  grad_clip_thresh: 1.0
+  grad_clip_thresh: 2.0
   grad_acc_step: 1
+
+# (0.9, 0.96) fast
+# [0.9, 0.98] pat
 
 scheduler:
   type: "warmup_cosine"
-  warmup_steps: 4000
+  warmup_steps: 20
 
 loss:
   pos_weight: 8.0
 
 training:
-  batch_size: 16
-  epochs: 100
+  batch_size: 32
+  epochs: 1000
   seed: 1234
-  save_step: 1000
-  log_step: 100
-  val_step: 500
-  test_step: 2000
-  eval_step: 1000
+  save_step: 2500
+  log_step: 50
+  val_step: 5000
+  test_step: 2500
 
 path:
   ckpt_path: "./ckpt"

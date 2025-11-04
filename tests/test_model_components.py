@@ -11,9 +11,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from model.echolancer import (
-    Echolancer, MultiHeadAttention, FeedForward, 
+    Echolancer, MultiHeadAttention, FeedForward,
     TransformerEncoderLayer, TransformerDecoderLayer,
-    TextEncoder, SpectrogramDecoderAR,
+    TextEncoder, AudioDecoderAR,
     expand_self_attention_mask, expand_masks2
 )
 from model.loss import EcholancerLoss
@@ -188,10 +188,10 @@ class TestModelComponents(unittest.TestCase):
         print("  TextEncoder: PASSED")
     
     def test_spectrogram_decoder(self):
-        """Test SpectrogramDecoderAR component."""
-        print("Testing SpectrogramDecoderAR...")
+        """Test AudioDecoderAR component."""
+        print("Testing AudioDecoderAR...")
         
-        decoder = SpectrogramDecoderAR(
+        decoder = AudioDecoderAR(
             encoder_channels=64,
             mel_channels=40,
             filter_channels=64,
@@ -215,7 +215,7 @@ class TestModelComponents(unittest.TestCase):
         # Test decoder
         logits, attn_logprob, x_mask_out, _ = decoder(x, x_mask, y, y_mask, spk_emb)
         self.assertEqual(logits.shape, (batch_size, seq_len_x-1, 1010))  # -1 because of shifting
-        print("  SpectrogramDecoderAR: PASSED")
+        print("  AudioDecoderAR: PASSED")
     
     def test_echolancer_model(self):
         """Test full Echolancer model."""
