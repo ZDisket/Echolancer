@@ -1,0 +1,30 @@
+# Model configuration
+model:
+  name: "echolancer"
+  vocab_size: 100 # Not used
+  emotion_channels: 0
+  speaker_channels: 192
+  multi_speaker: True
+  n_speaker: 0
+  use_alibi: True
+  alibi_alpha: 1.0
+  activation: "relu2"
+  vq_token_mode: False  # Enable zero-shot mode with VQ tokens
+  zero_shot_mode: True # Enable zero shot mode with external embedder.
+  vq_vocab_size: 65536   # NeuCodec
+  encoder_kv_heads: 4  # Number of key/value heads for encoder GQA (null = MHA)
+  decoder_kv_heads: 4  # Number of key/value heads for decoder GQA (null = MHA)
+
+  decoder:
+    hidden: 1024
+    head: 16
+    layer: 10            # +1 layer vs enc
+    dropout: 0.0
+    forward_expansion: 4 
+
+# Dataset configuration
+dataset:
+  name: "dummy"
+  path: "./data"
+  train_file: "train.txt"
+  val_file: "val.txt"

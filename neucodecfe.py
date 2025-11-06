@@ -46,13 +46,13 @@ class NeuCodecFE():
         Decodes discrete codes back to audio using NeuCodec.
 
         Args:
-          codes (torch.Tensor): Discrete codes tensor of shape (B, 1, T_code_len)
+          codes (torch.Tensor): Discrete codes tensor of shape (B, 1, T_code_len) or (B, T_len)
 
         Returns:
           torch.Tensor: Reconstructed audio tensor of shape (B, 1, T_audio)
         """
         with torch.no_grad():
-            codes = codes.to(self.device)
+            codes = codes.to(self.device).view(codes.size(0), 1, -1) # reshape (B, T) to (B, 1, T)
             codes = codes - self.offset
             reconstructed_audio = self.model.decode_code(codes)
         return reconstructed_audio

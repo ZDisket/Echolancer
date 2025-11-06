@@ -965,8 +965,6 @@ class AudioDecoderAR(nn.Module):
         self.lora_dropout = lora_dropout
         self.lora_scale = lora_scale
 
-        #self.spk_cond = nn.Linear(speaker_channels, filter_channels) if speaker_channels > 0 else None
-       # self.spk_film = FiLM(filter_channels, speaker_channels) if speaker_channels > 0 else None
         self.spk_cond = None
         if self.dec_type == "transformer":
             self.embed = None
@@ -1003,9 +1001,8 @@ class AudioDecoderAR(nn.Module):
                 - hidden_out: Decoder hidden states (B, seq_len_x-1, d_model)
         """
         B, L = x.size()
-        spk_res = None
-        # Create attention masks
 
+        # Create attention masks
         self_attn_mask = expand_self_attention_mask(x_mask)
             
         # Embed input tokens
@@ -1014,9 +1011,6 @@ class AudioDecoderAR(nn.Module):
         if x_mask is not None:
             x = x.masked_fill(x_mask.unsqueeze(-1), 0.0)
 
-        # Apply speaker conditioning if provided
-      #  if self.speaker_channels > 0 and spk_emb is not None:
-       #     x = self.spk_film(x, spk_emb.squeeze(1))
 
         # Decoder forward pass
         if self.decoder_type == "transformer":
@@ -1052,8 +1046,6 @@ class AudioDecoderAR(nn.Module):
                                        device=device)
         else:
             decoder_input = input_tokens
-
-        print(f"inps {decoder_input.size()}")
 
         token_outputs = []  # To store generated token IDs
         finished = torch.zeros(B, dtype=torch.bool, device=device)
@@ -1362,7 +1354,7 @@ class Echolancer(nn.Module):
             # Zero-shot mode: use provided speaker embeddings
             batch_size = spk_ids.size(0)
             spk_emb = spk_ids.view(batch_size, 1, -1)  # (B, 1, speaker_channels)
-          #  spk_emb = F.normalize(spk_emb, p=2, dim=-1)  # normalize along last dim
+            spk_emb = F.normalize(spk_emb, p=2, dim=-1)  # normalize along last dim
         else:
             # No speaker conditioning
             spk_emb = None
