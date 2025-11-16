@@ -90,12 +90,19 @@ class ConcatTextAudioSharded(torch.utils.data.Dataset):
         return shard
 
     def _encode_text(self, text):
-        ids = self.text_tokenizer.encode(text, add_bos=True, add_eos=True)
-        if not torch.is_tensor(ids):
-            ids = torch.as_tensor(ids, dtype=torch.long)
+        if torch.is_tensor(text):
+            # If text is already a tensor, return it as-is (assuming it's already properly formatted with BOS/EOS)
+            if not text.dtype == torch.long:
+                text = text.to(dtype=torch.long)
+            return text
         else:
-            ids = ids.to(dtype=torch.long)
-        return ids
+            # If text is a string, tokenize it
+            ids = self.text_tokenizer.encode(text, add_bos=True, add_eos=True)
+            if not torch.is_tensor(ids):
+                ids = torch.as_tensor(ids, dtype=torch.long)
+            else:
+                ids = ids.to(dtype=torch.long)
+            return ids
 
     def _encode_audio(self, codes_tensor):
         if not torch.is_tensor(codes_tensor):
