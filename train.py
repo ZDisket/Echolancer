@@ -4,6 +4,8 @@ Why do I have to write machine learning code? I should be eating ice cream and p
 import os
 # TF32 on ROCm is disabled unless we do this.
 os.environ["HIPBLASLT_ALLOW_TF32"] = "1"
+# CUDAgraphs prevent us from using grad acc and torch.compile
+os.environ["TORCHINDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
 from contextlib import nullcontext
 import torch
 torch.backends.cuda.enable_cudagraph_trees = False
@@ -410,7 +412,7 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
             continue
             
         # Process concatenated sequence data
-        torch.compiler.cudagraph_mark_step_begin()
+
 
         try:
             # Get batch of concatenated sequences (B, seq_len)
@@ -419,11 +421,12 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
             batch_size, seq_len, inputs, targets, sequence_lengths, speakers = extract_batch(batch, config)
 
             # For the decoder, we want to predict the next token in the concatenated sequence
-            decoder_input = inputs  # Use all but last token as input
-            decoder_target = targets  # Use all but first token as target
+            decoder_input = inputs.clone()  # Use all but last token as input
+            decoder_target = targets.clone()  # Use all but first token as target
 
             # Forward pass for the model
             with autocast_ctx():
+                torch.compiler.cudagraph_mark_step_begin()
                 decoder_logits = model(decoder_input, sequence_lengths, speakers, None)
 
             # Calculate decoder loss - predict the next token in sequence
@@ -448,7 +451,7 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
 
         if step % config.grad_acc_step == 0:
             # Zero gradients at the beginning of accumulation cycle
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         if grad_scaler is not None:
             # Scale the loss and perform backward pass with gradient scaling
@@ -550,7 +553,7 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
         })
 
         # Perform validation if interval is set and current step matches the validation interval
-        if config.val_interval_steps > 0 and current_global_step % config.val_interval_steps == 0 and validation_fn is not None:
+        if config.val_interval_steps > 0 and current_global_step % config.val_interval_steps == 0 and validation_fn is not None and config.shard_type != 0:
             print(f"Performing validation at step {current_global_step}")
             val_loss = validation_fn(model, val_dataloader, config, autocast_ctx, wandb_logger, current_global_step, optimizer)
             print(f"Validation Loss at step {current_global_step}: {val_loss:.4f}")
@@ -649,11 +652,13 @@ def generate_audio_test(model, config, text_tokenizer, wandb_logger, step=None):
     for n in range(0, n_seqs):
         with torch.no_grad(), torch.compiler.set_stance("force_eager"):
 
-            if config.shard_type != 1:
+            if config.shard_type == 2:
                 spk = speakers[n]
                 spk = torch.tensor([spk], dtype=torch.long, device=config.device) # (B,)
-            else:
+            elif config.shard_type == 1:
                 spk = speakers[n].to(config.device).unsqueeze(0) # (1, spk_hidden)
+            elif config.shard_type == 0:
+                spk = None # Pretraining has no speaker cond
 
             text_input = prepare_text_tokens(config.test_texts[n], text_tokenizer, model, device=config.device)
             generated_tokens = model.infer(text_input, spk, max_length=768, top_p=0.92, temperature=0.8) # (1, T)
@@ -1088,7 +1093,6 @@ def main():
     # Extract parameters from configs
     # Model config extraction
     model_params = model_config['model']
-    encoder_params = model_params['encoder']
     decoder_params = model_params['decoder']
 
     # Training config extraction
@@ -1124,7 +1128,7 @@ def main():
         max_val_samples=pretraining_params.get('max_val_samples', 2500),
         n_test_audios=pretraining_params.get('testing', {}).get('n_test_audios', 10),
         gpu_flops=train_config.get('gpu_flops', 0),
-        seq_len=pretraining_params.get('seq_len', 2048),
+        seq_len=training_params.get('seq_len', 2048),
         text_vocab_size=len(CharTokenizer()) if hasattr(CharTokenizer(), '__len__') else CharTokenizer().get_vocab_size(),
         audio_vocab_size=model_params.get('vq_vocab_size', 64000),
         lora_rank=train_config.get('lora_rank', 0),
@@ -1218,9 +1222,9 @@ def main():
             shards_dir=config.shards_dir,
             text_tokenizer=text_tokenizer,
             seq_len=config.seq_len,
-            audio_bos_id=model.decoder.bos_token_id,  # Audio BOS ID - adjust as needed
-            audio_eos_id=model.decoder.eos_token_id,  # Audio EOS ID - adjust as needed
-            max_shard_cache=2,
+            audio_bos_id=model.decoder.bos_token_id,
+            audio_eos_id=model.decoder.eos_token_id,
+            max_shard_cache=16,
         )
 
         # Training data loader setup with shard-aware sampler for concatenated data
@@ -1252,7 +1256,7 @@ def main():
     print(f"Dataset split: {train_size} train, {val_size} validation")
 
     # Create data loaders using config values
-    n_workers = os.cpu_count() // 2
+    n_workers = (os.cpu_count() // 2) + (os.cpu_count() // 4)
     
 
     train_dataloader = DataLoader(
@@ -1263,6 +1267,7 @@ def main():
         pin_memory=True,
         drop_last=True,
         collate_fn=collate_fun,
+        prefetch_factor=2,
     )
     
     # For validation, we can use a subset of the dataset with regular DataLoader
@@ -1389,7 +1394,7 @@ def main():
     enable_torch_compile = train_config.get('enable_torch_compile', False)
     if enable_torch_compile and hasattr(torch, 'compile'):
         print("Compiling whole model with torch.compile...")
-        model = torch.compile(model,  **train_config.get('torch_compile_args', {}))
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
         print("Model compilation completed.")
     elif enable_torch_compile:
         print("torch.compile requested but not available in this PyTorch version.")
