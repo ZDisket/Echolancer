@@ -14,6 +14,7 @@ model:
   vq_vocab_size: 65536   # NeuCodec
   encoder_kv_heads: 4  # Number of key/value heads for encoder GQA (null = MHA)
   decoder_kv_heads: 4  # Number of key/value heads for decoder GQA (null = MHA)
+  use_macaron: False
 
   decoder:
     hidden: 1024

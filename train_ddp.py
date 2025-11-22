@@ -1340,6 +1340,7 @@ def main():
         lora_dropout=config.lora_dropout,
         lora_scale=config.lora_scale,
         zero_shot_mode=model_params['zero_shot_mode'],
+        use_macaron=model_params['use_macaron'],
     )
 
     if args.pretrained is not None and is_main_process():

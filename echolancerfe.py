@@ -65,7 +65,10 @@ class EcholancerFE:
         vq_vocab_size = model_kwargs.get('vq_vocab_size', model_params['vq_vocab_size'])
         decoder_kv_heads = model_kwargs.get('decoder_kv_heads', model_params['decoder_kv_heads'])
         pretraining_mode = model_kwargs.get('pretraining_mode', model_params.get('pretraining_mode', True))
+
         zero_shot_mode = model_kwargs.get('zero_shot_mode', model_params.get('zero_shot_mode', False))
+        use_macaron = model_kwargs.get('use_macaron', model_params.get('use_macaron', False))
+
         
         # Create the model with parameters
         text_vocab_size = self.get_vocab_offset()
@@ -96,7 +99,9 @@ class EcholancerFE:
             lora_alpha=model_kwargs.get('lora_alpha', 16),
             lora_dropout=model_kwargs.get('lora_dropout', 0.0),
             lora_scale=model_kwargs.get('lora_scale', 1.0),
+
             zero_shot_mode=zero_shot_mode,
+            use_macaron=use_macaron,
         )
         
         # Load the checkpoint
