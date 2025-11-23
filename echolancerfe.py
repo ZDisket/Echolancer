@@ -28,13 +28,15 @@ class EcholancerFE:
     def get_vocab_offset(self):
         return self.tokenizer.get_vocab_size()
     
-    def load_checkpoint(self, checkpoint_path, model_config_path=None, **model_kwargs):
+    def load_checkpoint(self, checkpoint_path, model_config_path=None, dtype_load=None, **model_kwargs):
         """
         Loads a checkpoint into the model.
 
         Args:
             checkpoint_path (str): Path to the checkpoint file (.pt)
             model_config_path (str, optional): Path to model config YAML if not provided in constructor
+            dtype_load (str, optional): Data type for loading model in half precision. 
+                                       Options: "float16" or "bfloat16". Defaults to None (full precision).
             **model_kwargs: Additional arguments to override model parameters
         """
         # Load model configuration if provided
@@ -124,6 +126,18 @@ class EcholancerFE:
         
         # Load state dict
         self.model.load_state_dict(cleaned_state_dict, strict=False)
+        
+        # Apply dtype conversion if specified
+        if dtype_load is not None:
+            if dtype_load.lower() == "float16":
+                self.model = self.model.half()  # Convert to float16
+                print(f"Model converted to float16 precision")
+            elif dtype_load.lower() == "bfloat16":
+                self.model = self.model.to(torch.bfloat16)  # Convert to bfloat16
+                print(f"Model converted to bfloat16 precision")
+            else:
+                raise ValueError(f"Invalid dtype_load: {dtype_load}. Must be 'float16' or 'bfloat16'")
+        
         self.model = self.model.to(self.device)
         self.model.eval()
         
