@@ -20,6 +20,7 @@ class EcholancerFE:
         """
         self.device = torch.device(device)
         self.model = None
+        self.model_dtype = None  # Track the dtype of the loaded model
         self.tokenizer = CharTokenizer()
         self.model_config_path = model_config_path
         
@@ -131,12 +132,16 @@ class EcholancerFE:
         if dtype_load is not None:
             if dtype_load.lower() == "float16":
                 self.model = self.model.half()  # Convert to float16
+                self.model_dtype = torch.float16
                 print(f"Model converted to float16 precision")
             elif dtype_load.lower() == "bfloat16":
                 self.model = self.model.to(torch.bfloat16)  # Convert to bfloat16
+                self.model_dtype = torch.bfloat16
                 print(f"Model converted to bfloat16 precision")
             else:
                 raise ValueError(f"Invalid dtype_load: {dtype_load}. Must be 'float16' or 'bfloat16'")
+        else:
+            self.model_dtype = torch.float32  # Default to float32
         
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -174,13 +179,20 @@ class EcholancerFE:
         # 3) Convert to tensor and batch it (1, L)
         text_input = torch.tensor(inp_seq, dtype=torch.long, device=self.device).unsqueeze(0)
         
+        # Move text_input to model dtype if using half precision
+        # Note: text_input is long dtype (token IDs), so we keep it as is
+        # The model's embedding layer will handle the conversion
+        
         # Prepare speaker tensor if needed
         if speaker_id is not None:
             if isinstance(speaker_id, torch.Tensor):
                 # If speaker_id is already a tensor (e.g., speaker embedding in zero-shot mode)
+                # Convert to model dtype if it's a float tensor
                 speaker_tensor = speaker_id.to(self.device)
+                if speaker_tensor.dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                    speaker_tensor = speaker_tensor.to(dtype=self.model_dtype)
             else:
-                # If speaker_id is an integer ID
+                # If speaker_id is an integer ID (long dtype, no conversion needed)
                 speaker_tensor = torch.tensor([speaker_id], dtype=torch.long, device=self.device)
         else:
             speaker_tensor = None
