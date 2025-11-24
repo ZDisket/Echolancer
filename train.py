@@ -1400,6 +1400,8 @@ def main():
                                                   text_tokenizer=text_tokenizer,shard_type=config.shard_type,
                                                   audio_bos_id=get_model(model).decoder.bos_token_id,
                                                   audio_eos_id=get_model(model).decoder.eos_token_id,
+                                                  ddp_rank=rank,
+                                                  ddp_world_size=world_size,
                                                   max_shards=None)
         # Use DistributedSampler for multi-GPU, otherwise use default sampler
         if world_size > 1:
