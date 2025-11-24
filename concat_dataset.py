@@ -214,6 +214,160 @@ class ShardAwareRandomSampler(torch.utils.data.Sampler):
             return full
         return self.ds.total_utts
 
+
+class DistributedShardAwareSampler(torch.utils.data.Sampler):
+    """
+    Distributed version of ShardAwareRandomSampler.
+    Ensures that each rank gets a subset of the blocks, preserving IO locality
+    while distributing the workload.
+    """
+
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, 
+                 seed=0, drop_last=False, block_utterances=4096):
+        if not isinstance(dataset, ConcatTextAudioSharded):
+            raise ValueError("DistributedShardAwareSampler expects ConcatTextAudioSharded dataset")
+        
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+        self.block_utterances = int(block_utterances)
+
+        if self.num_replicas is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            self.num_replicas = torch.distributed.get_world_size()
+        
+        if self.rank is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            self.rank = torch.distributed.get_rank()
+            
+        if self.rank >= self.num_replicas or self.rank < 0:
+            raise ValueError(
+                "Invalid rank {}, rank should be in the interval"
+                " [0, {}]".format(self.rank, self.num_replicas - 1))
+                
+        # Precompute per-shard local index permutations (same for all ranks initially)
+        # We use a fixed seed here so all ranks agree on the inner-shard permutation
+        # The randomness across epochs comes from shuffling the BLOCKS, not the inner items
+        g = random.Random(self.seed) 
+        self.per_shard_perm = []
+        for shard_id, size in enumerate(self.dataset.shard_sizes):
+            order = list(range(size))
+            g.shuffle(order)
+            self.per_shard_perm.append(order)
+
+        # Split each shard's perm into blocks
+        self.blocks = []  # list of (shard_id, start_offset, block_len)
+        for shard_id, order in enumerate(self.per_shard_perm):
+            n = len(order)
+            for i in range(0, n, self.block_utterances):
+                blen = min(self.block_utterances, n - i)
+                if self.drop_last and blen < self.block_utterances:
+                    break
+                self.blocks.append((shard_id, i, blen))
+                
+        # Calculate total size for this rank
+        # We need to know how many blocks this rank will get
+        self.num_samples = 0
+        # This is an approximation since we don't know exactly which blocks we'll get until iter
+        # But for __len__ we usually need a constant. 
+        # Standard DistributedSampler strategy:
+        # If drop_last is True, we drop the tail blocks that don't fit evenly
+        # If drop_last is False, we might pad (or just have uneven sizes)
+        
+        # Total blocks available
+        total_blocks = len(self.blocks)
+        
+        if self.drop_last:
+            self.num_blocks_per_rank = total_blocks // self.num_replicas
+        else:
+            self.num_blocks_per_rank = math.ceil(total_blocks / self.num_replicas)
+            
+        self.total_size = self.num_blocks_per_rank * self.num_replicas
+        
+        # Note: The actual number of samples yielded might vary slightly because blocks 
+        # can have different sizes (the last block of a shard). 
+        # However, PyTorch samplers usually expect __len__ to return number of indices.
+        # Since we yield indices one by one, we can't easily predict exact sample count 
+        # without simulating the shuffle.
+        # For progress bars, an estimate is usually fine.
+
+    def __iter__(self):
+        # Deterministically shuffle blocks based on epoch and seed
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        
+        indices = torch.randperm(len(self.blocks), generator=g).tolist()
+        
+        # Add extra blocks to make it evenly divisible across ranks
+        if not self.drop_last:
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+        else:
+            # Remove tail of data to make it evenly divisible
+            indices = indices[:self.total_size]
+            
+        assert len(indices) == self.total_size
+        
+        # Subsample blocks for this rank
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_blocks_per_rank
+        
+        # Collect all sample indices from assigned blocks
+        all_samples = []
+        for block_idx in indices:
+            shard_id, start, blen = self.blocks[block_idx]
+            order = self.per_shard_perm[shard_id]
+            
+            for j in range(start, start + blen):
+                local_idx = order[j]
+                all_samples.append(self.dataset._encode_index(shard_id, local_idx))
+        
+        # CRITICAL: Ensure all ranks yield the same number of samples
+        # Compute the target number of samples per rank
+        if not self.drop_last:
+            # Pad to make all ranks have the same length
+            num_samples = math.ceil(self.dataset.total_utts / self.num_replicas)
+        else:
+            # Drop to make all ranks have the same length
+            num_samples = self.dataset.total_utts // self.num_replicas
+        
+        # Pad or truncate to exactly num_samples
+        if len(all_samples) < num_samples:
+            # Pad by repeating samples
+            padding_size = num_samples - len(all_samples)
+            if padding_size <= len(all_samples):
+                all_samples += all_samples[:padding_size]
+            else:
+                all_samples += (all_samples * math.ceil(padding_size / len(all_samples)))[:padding_size]
+        elif len(all_samples) > num_samples:
+            # Truncate
+            all_samples = all_samples[:num_samples]
+        
+        assert len(all_samples) == num_samples
+        
+        # Yield samples
+        for sample_idx in all_samples:
+            yield sample_idx
+
+    def __len__(self):
+        # Return the exact number of samples this rank will yield
+        if not self.drop_last:
+            return math.ceil(self.dataset.total_utts / self.num_replicas)
+        else:
+            return self.dataset.total_utts // self.num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
 # ===== Example usage =====
 # from torch.utils.data import DataLoader
 # ds = ConcatTextAudioSharded(

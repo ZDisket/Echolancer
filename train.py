@@ -1,5 +1,7 @@
 """
 Why do I have to write machine learning code? I should be eating ice cream and playing Hearts of Iron IV.
+
+DDP-enabled training script for multi-GPU training on a single node.
 """
 import os
 # TF32 on ROCm is disabled unless we do this.
@@ -8,6 +10,10 @@ os.environ["HIPBLASLT_ALLOW_TF32"] = "1"
 os.environ["TORCHINDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
 from contextlib import nullcontext
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 torch.backends.cuda.enable_cudagraph_trees = False
 torch.backends.cudnn.benchmark = True
 
@@ -30,7 +36,7 @@ import time
 import numpy as np
 from tqdm import tqdm
 from data import PreprocessedVQAudioDataset
-from concat_dataset import ConcatTextAudioSharded, ShardAwareRandomSampler, collate_stack
+from concat_dataset import ConcatTextAudioSharded, ShardAwareRandomSampler, collate_stack, DistributedShardAwareSampler
 from paired_dataset_concat import TTSPairedVQConcatDataset, tts_paired_vq_concat_collate
 from model.echolancer import Echolancer
 from torch.cuda.amp import autocast, GradScaler
@@ -39,6 +45,26 @@ import wandb
 from utils.logger import WandbLogger
 import random
 
+
+
+def is_main_process():
+    """
+    Check if this is the main process (rank 0).
+    """
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def print_rank0(*args, **kwargs):
+    """
+    Print only on the main process (rank 0) to avoid duplicate output in multi-GPU training.
+    
+    Args:
+        *args, **kwargs: Same arguments as built-in print()
+    """
+    if is_main_process():
+        print(*args, **kwargs)
+
+
 # Import Transformer Engine if available
 try:
     import transformer_engine.pytorch as te
@@ -46,15 +72,83 @@ try:
     TRANSFORMER_ENGINE_AVAILABLE = True
 except ImportError:
     TRANSFORMER_ENGINE_AVAILABLE = False
-    print("WARNING: Transformer Engine not available. FP8 training will not be possible.")
+    print_rank0("WARNING: Transformer Engine not available. FP8 training will not be possible.")
 
 # Import NeuCodecFE if available, otherwise set a flag
 try:
     from neucodecfe import NeuCodecFE
     NEUCODEC_AVAILABLE = True
 except ImportError:
-    print("Warning: neucodec module not available. Testing with audio generation will be disabled.")
+    print_rank0("Warning: neucodec module not available. Testing with audio generation will be disabled.")
     NEUCODEC_AVAILABLE = False
+
+
+
+def setup_distributed():
+    """
+    Initialize the distributed environment for single-node multi-GPU training.
+    Uses environment variables set by torchrun.
+    """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        # Single GPU mode
+        rank = 0
+        world_size = 1
+        local_rank = 0
+    
+    # Initialize process group for single-node training
+    if world_size > 1:
+        # Set the device for this process BEFORE init_process_group
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend='nccl',  # NCCL is best for GPU training
+            init_method='env://',  # Use environment variables
+            world_size=world_size,
+            rank=rank,
+            device_id=torch.device(f'cuda:{local_rank}')  # Explicitly specify device to avoid NCCL warning
+        )
+    
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """
+    Clean up the distributed environment.
+    """
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+
+def get_model(model):
+    """
+    Get the underlying model, unwrapping DDP if necessary.
+    
+    Args:
+        model: The model, potentially wrapped with DistributedDataParallel
+    
+    Returns:
+        The underlying model
+    """
+    model_unwrapped = model
+    # Unwrap torch.compile wrapper (OptimizedModule)
+    if hasattr(model_unwrapped, "_orig_mod"):
+        model_unwrapped = model_unwrapped._orig_mod
+    
+    # Unwrap DDP wrapper
+    if isinstance(model_unwrapped, DDP):
+        model_unwrapped = model_unwrapped.module
+        
+    # Unwrap torch.compile wrapper again (in case of DDP(Compile(model)))
+    if hasattr(model_unwrapped, "_orig_mod"):
+        model_unwrapped = model_unwrapped._orig_mod
+        
+    return model_unwrapped
+
+
 
 
 class TrainingConfig:
@@ -76,6 +170,7 @@ class TrainingConfig:
         self.max_val_samples = kwargs.get('max_val_samples', 2500)
         self.n_test_audios = kwargs.get('n_test_audios', 10)
         self.gpu_flops = kwargs.get('gpu_flops', 0)
+        self.eos_bos_id = kwargs.get('eos_bos_id', (-1, -2))
         
         # Model parameters
         self.seq_len = kwargs.get('seq_len', 2048)
@@ -395,13 +490,19 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
     # Initialize variables for MFU calculation
     log_start_time = time.time()
     
-    # Create tqdm progress bar for the epoch
-    epoch_pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch_num + 1}", leave=False)
+    # Create tqdm progress bar for the epoch (only on main process)
+    if is_main_process():
+        epoch_pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch_num + 1}", leave=False)
+    else:
+        epoch_pbar = None
     
     # Create iterator
     data_iter = iter(dataloader)
     
-    for step in epoch_pbar:
+    for step in range(steps_per_epoch):
+        # Update progress bar on main process
+        if epoch_pbar is not None:
+            epoch_pbar.update(1)
         # Skip steps if resuming from a checkpoint in the middle of an epoch
         if step < skip_steps:
             # Skip this step by fetching the batch but not processing it
@@ -436,7 +537,7 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
                 config.text_vocab_size,
                 ignore_index=-200,
                 target_lengths=sequence_lengths,
-                token_id_weights={model.decoder.eos_token_id: 3.0},
+                token_id_weights={get_model(model).decoder.eos_token_id: 3.0},
             )
 
         except StopIteration:
@@ -524,10 +625,11 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
             if mfu is not None:
                 print_str += f", MFU: {mfu:.2f}%"
             
-            print(print_str)
+            # Only print on main process
+            print_rank0(print_str)
             
-            # Log training metrics to wandb (with text and audio losses separately)
-            if wandb_logger is not None:
+            # Log training metrics to wandb (with text and audio losses separately) - only on main process
+            if wandb_logger is not None and is_main_process():
                 train_metrics = {
                     "train/loss": total_batch_loss.item(),
                     "train/text_loss": text_loss.item() if hasattr(text_loss, 'item') else text_loss,
@@ -544,36 +646,41 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
                     
                 wandb_logger.log_metrics(train_metrics, current_global_step)
 
-        # Update progress bar description with current loss
-        epoch_pbar.set_postfix({
-            'loss': f'{total_batch_loss.item():.4f}',
-            'text_loss': f'{text_loss.item():.4f}',
-            'audio_loss': f'{audio_loss.item():.4f}',
-            'step': f'{step}/{steps_per_epoch}'
-        })
+        # Update progress bar description with current loss (only on main process)
+        if epoch_pbar is not None:
+            epoch_pbar.set_postfix({
+                'loss': f'{total_batch_loss.item():.4f}',
+                'text_loss': f'{text_loss.item():.4f}',
+                'audio_loss': f'{audio_loss.item():.4f}',
+                'step': f'{step}/{steps_per_epoch}'
+            })
 
         # Perform validation if interval is set and current step matches the validation interval
-        if config.val_interval_steps > 0 and current_global_step % config.val_interval_steps == 0 and validation_fn is not None and config.shard_type != 0:
-            print(f"Performing validation at step {current_global_step}")
+        if config.val_interval_steps > 0 and current_global_step % config.val_interval_steps == 0 and validation_fn is not None and config.shard_type != 0 and is_main_process():
+            print_rank0(f"Performing validation at step {current_global_step}")
             val_loss = validation_fn(model, val_dataloader, config, autocast_ctx, wandb_logger, current_global_step, optimizer)
-            print(f"Validation Loss at step {current_global_step}: {val_loss:.4f}")
+            print_rank0(f"Validation Loss at step {current_global_step}: {val_loss:.4f}")
             torch.cuda.empty_cache()
 
 
-        # Perform testing if interval is set and current step matches the test interval
-        if config.test_interval_steps > 0 and current_global_step % config.test_interval_steps == 0:
-            print(f"Generating audio test samples at step {current_global_step}")
+        # Perform testing if interval is set and current step matches the test interval (only on main process)
+        if config.test_interval_steps > 0 and current_global_step % config.test_interval_steps == 0 and is_main_process():
+            print_rank0(f"Generating audio test samples at step {current_global_step}")
             test_output_dir = os.path.join(config.output_dir, f"test_audio_step_{current_global_step}")
             generate_audio_test(model, config, text_tokenizer, wandb_logger, current_global_step)
             torch.cuda.empty_cache()
 
-        # Save checkpoint every save_interval_steps
-        if config.save_interval_steps > 0 and current_global_step % config.save_interval_steps == 0:
+        # Save checkpoint every save_interval_steps (only on main process)
+        if config.save_interval_steps > 0 and current_global_step % config.save_interval_steps == 0 and is_main_process():
             checkpoint_path = os.path.join(config.output_dir, f"checkpoint_step_{current_global_step}.pt")
+            
+            # Get the actual model (unwrap DDP if necessary)
+            model_to_save = get_model(model)
+            
             if config.lora_rank > 0:
                 # For LoRA, save both LoRA parameters and potentially base model state
                 # We can save just the LoRA parameters for efficiency
-                lora_state_dict = {k: v for k, v in model.state_dict().items() 
+                lora_state_dict = {k: v for k, v in model_to_save.state_dict().items() 
                                    if 'lora_A' in k or 'lora_B' in k}
                 torch.save({
                     'global_step': current_global_step,
@@ -589,12 +696,13 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
             else:
                 torch.save({
                     'global_step': current_global_step,
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': model_to_save.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, checkpoint_path)
-            print(f"Checkpoint saved to {checkpoint_path}")
+            print_rank0(f"Checkpoint saved to {checkpoint_path}")
     
-    epoch_pbar.close()
+    if epoch_pbar is not None:
+        epoch_pbar.close()
 
     return total_loss / max(total_steps, 1) if total_steps > 0 else 0, total_steps
 
@@ -603,7 +711,7 @@ def prepare_text_tokens(text, text_tokenizer, model, device, add_bos=True, add_e
     inp_seq = text_tokenizer.encode(text, add_bos=add_bos, add_eos=add_eos)
 
     # 2) Append decoder BOS token for the audio segment
-    inp_seq.append(int(model.decoder.bos_token_id))
+    inp_seq.append(int(get_model(model).decoder.bos_token_id))
 
     # 3) Convert to tensor and batch it (1, L)
     x_in = torch.tensor(inp_seq, dtype=torch.long, device=device).unsqueeze(0)
@@ -622,10 +730,10 @@ def generate_audio_test(model, config, text_tokenizer, wandb_logger, step=None):
         step: Current training step for logging
     """
     if not NEUCODEC_AVAILABLE:
-        print("NeuCodec not available. Skipping audio generation test.")
+        print_rank0("NeuCodec not available. Skipping audio generation test.")
         return
 
-    print(f"Generating {config.n_test_audios} audio samples for testing...")
+    print_rank0(f"Generating {config.n_test_audios} audio samples for testing...")
 
     # Create output directory
     output_dir = os.path.join(config.output_dir, f"test_audio_step_{step}" if step is not None else "test_audio")
@@ -636,12 +744,12 @@ def generate_audio_test(model, config, text_tokenizer, wandb_logger, step=None):
     torch.cuda.empty_cache()
 
     # Initialize NeuCodecFE for this test
-    neu_codec_fe = NeuCodecFE(is_cuda=config.device.type == 'cuda', offset=model.decoder.vocab_offset)
+    neu_codec_fe = NeuCodecFE(is_cuda=config.device.type == 'cuda', offset=get_model(model).decoder.vocab_offset)
 
     # Generate speaker embeddings for testing (if applicable)
     # Using random speaker embeddings for testing purposes
     n_seqs = min(config.n_test_audios, 4)  # Keep batch size reasonable
-    if model.speaker_channels > 0:
+    if get_model(model).speaker_channels > 0:
         speakers = config.test_speakers
     else:
         speakers = None
@@ -661,7 +769,7 @@ def generate_audio_test(model, config, text_tokenizer, wandb_logger, step=None):
                 spk = None # Pretraining has no speaker cond
 
             text_input = prepare_text_tokens(config.test_texts[n], text_tokenizer, model, device=config.device)
-            generated_tokens = model.infer(text_input, spk, max_length=768, top_p=0.92, temperature=0.8) # (1, T)
+            generated_tokens = get_model(model).infer(text_input, spk, max_length=768, top_p=0.92, temperature=0.8) # (1, T)
 
             # Decode and save with NeuCodec
 
@@ -669,6 +777,9 @@ def generate_audio_test(model, config, text_tokenizer, wandb_logger, step=None):
             generated_tokens = generated_tokens[:, :-1]
 
             generated_tokens = generated_tokens.unsqueeze(1) # (1, 1, T) as codec expects
+
+            vq_vocab_size = config.model_config['model']['vq_vocab_size']
+            generated_tokens = generated_tokens.clamp(0, vq_vocab_size - 1) # clamp to valid range, just in case.
 
             reconstructed_audio = neu_codec_fe.decode_codes(generated_tokens)
 
@@ -685,7 +796,7 @@ def generate_audio_test(model, config, text_tokenizer, wandb_logger, step=None):
             # Save audio file
             audio_file_path = os.path.join(output_dir, f"generated_audio_sample_{n}.wav")
             torchaudio.save(audio_file_path, audio_to_save.unsqueeze(0), 24000)
-            print(f"Saved generated audio to: {audio_file_path}")
+            print_rank0(f"Saved generated audio to: {audio_file_path}")
 
             # Log audio to wandb if logger is provided
             if step is not None and wandb_logger is not None:
@@ -696,7 +807,7 @@ def generate_audio_test(model, config, text_tokenizer, wandb_logger, step=None):
                     step=step
                 )
 
-    print(f"Completed generating audio samples.")
+    print_rank0(f"Completed generating audio samples.")
 
 
 def validate(model, dataloader, config, autocast_ctx=None, wandb_logger=None, step=None, optimizer=None):
@@ -721,8 +832,11 @@ def validate(model, dataloader, config, autocast_ctx=None, wandb_logger=None, st
         # Create iterator
         data_iter = iter(dataloader)
 
-        # Create tqdm progress bar for validation
-        val_pbar = tqdm(range(max_steps), desc="Validation", leave=False)
+        # Create tqdm progress bar for validation (only on main process)
+        if is_main_process():
+            val_pbar = tqdm(range(max_steps), desc="Validation", leave=False)
+        else:
+            val_pbar = None
 
         for step_idx in val_pbar:
             # Validate on concatenated sequences only
@@ -747,7 +861,7 @@ def validate(model, dataloader, config, autocast_ctx=None, wandb_logger=None, st
                     config.text_vocab_size,
                     ignore_index=-200,
                     target_lengths=sequence_lengths,
-                    token_id_weights={model.decoder.eos_token_id: 3.0},
+                    token_id_weights={get_model(model).decoder.eos_token_id: 3.0},
                 )
 
 
@@ -765,20 +879,22 @@ def validate(model, dataloader, config, autocast_ctx=None, wandb_logger=None, st
 
             # If we're in zero shot mode and have no test speakers, supply test speaker embeddings from the
             # validation dataloader.
-            if config.shard_type == 1 and config.test_speakers is None:
+            if config.shard_type == 1 and config.test_speakers is None and is_main_process():
                 config.test_speakers = speakers
-                print(f"Eval::Zero shot mode detected, but no test speakers configured. Supplying with {speakers.size(0)} speakers from the validation set.")
+                print_rank0(f"Eval::Zero shot mode detected, but no test speakers configured. Supplying with {speakers.size(0)} speakers from the validation set.")
 
-            # Update progress bar description with current loss
-            val_pbar.set_postfix({
-                'loss': f'{total_batch_loss.item():.4f}',
-                'text_loss': f'{text_loss.item():.4f}',
-                'audio_loss': f'{audio_loss.item():.4f}',
-                'step': f'{step_idx + 1}/{max_steps}'
-            })
+            # Update progress bar description with current loss (only on main process)
+            if val_pbar is not None:
+                val_pbar.set_postfix({
+                    'loss': f'{total_batch_loss.item():.4f}',
+                    'text_loss': f'{text_loss.item():.4f}',
+                    'audio_loss': f'{audio_loss.item():.4f}',
+                    'step': f'{step_idx + 1}/{max_steps}'
+                })
 
         # Close the validation progress bar
-        val_pbar.close()
+        if val_pbar is not None:
+            val_pbar.close()
 
     avg_loss = total_loss / max(total_steps, 1) if total_steps > 0 else 0
     avg_decoder_loss = total_decoder_loss / max(total_steps, 1) if total_steps > 0 else 0
@@ -790,8 +906,8 @@ def validate(model, dataloader, config, autocast_ctx=None, wandb_logger=None, st
     avg_text_perplexity = torch.exp(torch.tensor(avg_text_loss))
     avg_audio_perplexity = torch.exp(torch.tensor(avg_audio_loss))
     
-    # Log validation metrics to wandb if logger is provided (with text and audio losses separately)
-    if wandb_logger is not None and step is not None:
+    # Log validation metrics to wandb if logger is provided (with text and audio losses separately) - only on main process
+    if wandb_logger is not None and step is not None and is_main_process():
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr'] if optimizer is not None else 0.0
         validation_metrics = {
@@ -942,7 +1058,7 @@ def load_pretrained(model, checkpoint_path, device="cpu", lora_enabled=False):
                 remapped[k] = v
 
     if is_lora_checkpoint and not lora_enabled:
-        print("Warning: LoRA checkpoint detected, but lora_enabled=False. Ignoring LoRA adapters.")
+        print_rank0("Warning: LoRA checkpoint detected, but lora_enabled=False. Ignoring LoRA adapters.")
 
     # ---- 3) Load model ------------------------------------------------------------
     load_info = model.load_state_dict(remapped, strict=False)
@@ -964,15 +1080,15 @@ def load_pretrained(model, checkpoint_path, device="cpu", lora_enabled=False):
     pct_missing = 100 * missing_params / total_params if total_params > 0 else 0
     pct_unexpected = 100 * unexpected_params / total_params if total_params > 0 else 0
 
-    print(f"Loaded checkpoint: {checkpoint_path}")
-    print(f"Missing params: {missing_params:,}  ({pct_missing:.4f}%)")
-    print(f"Unexpected params: {unexpected_params:,}  ({pct_unexpected:.4f}%)")
-    print(f"Total params in model: {total_params:,}")
+    print_rank0(f"Loaded checkpoint: {checkpoint_path}")
+    print_rank0(f"Missing params: {missing_params:,}  ({pct_missing:.4f}%)")
+    print_rank0(f"Unexpected params: {unexpected_params:,}  ({pct_unexpected:.4f}%)")
+    print_rank0(f"Total params in model: {total_params:,}")
 
     if is_lora_checkpoint:
-        print("Detected LoRA checkpoint.")
+        print_rank0("Detected LoRA checkpoint.")
     else:
-        print("Detected base checkpoint.")
+        print_rank0("Detected base checkpoint.")
 
     if lora_enabled and hasattr(model, "enable_lora"):
         try:
@@ -987,12 +1103,15 @@ def load_pretrained(model, checkpoint_path, device="cpu", lora_enabled=False):
 import torch.nn as nn
 
 def unfreeze_last_n_layers_with_tied_head(model, n_last):
+    # Unwrap DDP if necessary
+    actual_model = get_model(model)
+    
     # 0) freeze everything
-    for p in model.parameters():
+    for p in actual_model.parameters():
         p.requires_grad = False
 
     # 1) unfreeze last N transformer layers
-    dec_layers = model.decoder.dec.layers
+    dec_layers = actual_model.decoder.dec.layers
     n = len(dec_layers)
     if n_last > 0:
         for layer in dec_layers[max(0, n - n_last):]:
@@ -1000,23 +1119,23 @@ def unfreeze_last_n_layers_with_tied_head(model, n_last):
                 p.requires_grad = True
 
     # 2) re-tie head to embedding (defensive) and unfreeze both
-    if hasattr(model, "combined_emb") and hasattr(model, "combined_head"):
-        if hasattr(model.combined_head, "weight") and hasattr(model.combined_emb, "weight"):
-            if model.combined_head.weight.data.shape == model.combined_emb.weight.data.shape:
+    if hasattr(actual_model, "combined_emb") and hasattr(actual_model, "combined_head"):
+        if hasattr(actual_model.combined_head, "weight") and hasattr(actual_model.combined_emb, "weight"):
+            if actual_model.combined_head.weight.data.shape == actual_model.combined_emb.weight.data.shape:
                 # share the same tensor to keep tying strict
-                model.combined_head.weight = model.combined_emb.weight
-        for p in model.combined_emb.parameters():
+                actual_model.combined_head.weight = actual_model.combined_emb.weight
+        for p in actual_model.combined_emb.parameters():
             p.requires_grad = True
-        for p in model.combined_head.parameters():
+        for p in actual_model.combined_head.parameters():
             p.requires_grad = True  # includes bias if present
 
     # 3) unfreeze all LayerNorms globally (includes layer.norm1, layer.norm3)
-   # for m in model.modules():
+   # for m in actual_model.modules():
     #    if isinstance(m, nn.LayerNorm):
      #       for p in m.parameters():
       #          p.requires_grad = True
 
-    print(f"Only trainable params are last {n_last} layers")
+    print_rank0(f"Only trainable params are last {n_last} layers")
     return model
 
 
@@ -1087,6 +1206,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Initialize distributed training
+    rank, world_size, local_rank = setup_distributed()
+    
+    # Set device based on local rank
+    if world_size > 1:
+        device = torch.device(f'cuda:{local_rank}')
+    else:
+        device = torch.device(args.device)
+    
+    # Only print on main process
+    print_rank0(f"Distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+    print_rank0(f"Device: {device}")
+
     # Load configurations from YAML files
     train_config, model_config, pretrain_config = load_configs(args.train_config, args.model_config, args.pretrain_config)
 
@@ -1105,11 +1237,13 @@ def main():
 
     # Extract mixed precision setting from training config
     mixed_precision = train_config.get('mixed_precision', 'none')
-    print(f"Mixed precision setting: {mixed_precision}")
+    print_rank0(f"Mixed precision setting: {mixed_precision}")
 
-    # Initialize Weights & Biases logging
-    train_config['wandb']['name'] = f"echolancer-pretrainv2-{int(time.time())}"
-    wandb_logger = WandbLogger(train_config)
+    # Initialize Weights & Biases logging (only on main process)
+    wandb_logger = None
+    if is_main_process():
+        train_config['wandb']['name'] = f"echolancer-pretrainv2-{int(time.time())}"
+        wandb_logger = WandbLogger(train_config)
 
     # Initialize training configuration object
     config = TrainingConfig(
@@ -1138,7 +1272,7 @@ def main():
         shards_dir=args.shards_dir,
         output_dir=args.out_dir,
         tokenizer_path=args.tokenizer_path,
-        device=torch.device(args.device),
+        device=device,  # Use the distributed device
         mixed_precision=mixed_precision,
         model_config=model_config,
         training_params=training_params,
@@ -1150,17 +1284,22 @@ def main():
 
     # Initialize mixed precision components based on config
     autocast_ctx, grad_scaler = get_mixed_precision_config(config.mixed_precision)
-    if autocast_ctx is not None:
-        print(f"Using mixed precision: {config.mixed_precision}")
-    else:
-        print("Mixed precision disabled")
+    if autocast_ctx is not None and is_main_process():
+        print_rank0(f"Using mixed precision: {config.mixed_precision}")
+    elif is_main_process():
+        print_rank0("Mixed precision disabled")
 
-    # Create output directory
-    os.makedirs(config.output_dir, exist_ok=True)
+    # Create output directory (only on main process)
+    if is_main_process():
+        os.makedirs(config.output_dir, exist_ok=True)
+    
+    # Synchronize all processes before continuing
+    if dist.is_initialized():
+        dist.barrier()
 
 
     # Create model with pretraining mode enabled (cross-attention disabled)
-    print("Creating model...")
+    print_rank0("Creating model...")
 
     # Initialize text tokenizer
     text_tokenizer = CharTokenizer()
@@ -1201,63 +1340,98 @@ def main():
         lora_dropout=config.lora_dropout,
         lora_scale=config.lora_scale,
         zero_shot_mode=model_params['zero_shot_mode'],
+        use_macaron=model_params['use_macaron'],
     )
 
-    if args.pretrained is not None:
-        print(f"Loading pretrained model from {args.pretrained}")
+    if args.pretrained is not None and is_main_process():
+        print_rank0(f"Loading pretrained model from {args.pretrained}")
         model = load_pretrained(model, args.pretrained, lora_enabled=config.lora_rank > 0)
 
-    if train_config.get('freeze_to', 0) > 0:
-        print("Doing partial training.")
+    if train_config.get('freeze_to', 0) > 0 and is_main_process():
+        print_rank0("Doing partial training.")
         unfreeze_last_n_layers_with_tied_head(model, train_config['freeze_to'])
 
     model = model.to(config.device)
 
+    # Wrap model with DDP for multi-GPU training
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        print_rank0(f"Model wrapped with DistributedDataParallel")
 
     # Create concatenated text-audio dataset
-    print("Creating concatenated text-audio dataset...")
+    print_rank0("Creating concatenated text-audio dataset...")
 
     if config.shard_type == 0:
         concat_dataset = ConcatTextAudioSharded(
             shards_dir=config.shards_dir,
             text_tokenizer=text_tokenizer,
             seq_len=config.seq_len,
-            audio_bos_id=model.decoder.bos_token_id,
-            audio_eos_id=model.decoder.eos_token_id,
+            audio_bos_id=get_model(model).decoder.bos_token_id,
+            audio_eos_id=get_model(model).decoder.eos_token_id,
             max_shard_cache=16,
         )
 
-        # Training data loader setup with shard-aware sampler for concatenated data
-        train_sampler = ShardAwareRandomSampler(
-            concat_dataset,
-            block_utterances=4096,
-            seed=42,
-            drop_last=True
-        )
+        # Training data loader setup with sampler for concatenated data
+        # Use DistributedSampler for multi-GPU, otherwise use ShardAwareRandomSampler
+        # Use DistributedShardAwareSampler for multi-GPU to preserve IO locality
+        if world_size > 1:
+            train_sampler = DistributedShardAwareSampler(
+                concat_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=42,
+                drop_last=True,
+                block_utterances=4096
+            )
+        else:
+            train_sampler = DistributedShardAwareSampler(
+                concat_dataset,
+                num_replicas=1, # For single GPU, treat as 1 replica
+                rank=0,         # For single GPU, rank is 0
+                shuffle=True,
+                seed=42,
+                drop_last=True,
+                block_utterances=4096
+            )
         collate_fun = collate_stack
     else:
         concat_dataset = TTSPairedVQConcatDataset(config.shards_dir,preload=True,
                                                   text_tokenizer=text_tokenizer,shard_type=config.shard_type,
-                                                  audio_bos_id=model.decoder.bos_token_id,
-                                                  audio_eos_id=model.decoder.eos_token_id,
+                                                  audio_bos_id=get_model(model).decoder.bos_token_id,
+                                                  audio_eos_id=get_model(model).decoder.eos_token_id,
+                                                  ddp_rank=rank,
+                                                  ddp_world_size=world_size,
                                                   max_shards=None)
-        train_sampler = None # Use default sampler
+        # Use DistributedSampler for multi-GPU, otherwise use default sampler
+        if world_size > 1:
+            train_sampler = DistributedSampler(
+                concat_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
+                seed=42
+            )
+        else:
+            train_sampler = None  # Use default sampler
         collate_fun = create_collate_fn(config.shard_type)
         train_config["enable_torch_compile"] = False # Turn off torch.compile for varseqlen.
         torch.backends.cudnn.benchmark = False
 
 
-    print(f"Concatenated dataset size: {len(concat_dataset)}")
+    print_rank0(f"Concatenated dataset size: {len(concat_dataset)}")
     
     # Calculate validation size
     val_size = min(int(len(concat_dataset) * config.val_split_ratio), config.max_val_samples)
     train_size = len(concat_dataset) - val_size
 
-    print(f"Dataset split: {train_size} train, {val_size} validation")
+    print_rank0(f"Dataset split: {train_size} train, {val_size} validation")
 
     # Create data loaders using config values
-    n_workers = (os.cpu_count() // 2) + (os.cpu_count() // 4)
-    
+    n_workers = ((os.cpu_count() // 2) + (os.cpu_count() // 4)) // world_size
+    # Limit n_workers to 16
+    n_workers = min(n_workers, 16)
 
     train_dataloader = DataLoader(
         concat_dataset,
@@ -1270,12 +1444,26 @@ def main():
         prefetch_factor=2,
     )
     
-    # For validation, we can use a subset of the dataset with regular DataLoader
+    # For validation, use DistributedSampler for multi-GPU or SubsetRandomSampler for single GPU
     # since we don't necessarily need shard-aware sampling for validation
-    val_sampler = torch.utils.data.SubsetRandomSampler(list(range(train_size, len(concat_dataset)))) if config.shard_type == 0 else None
+    if world_size > 1:
+        # Create a subset of indices for validation
+        val_indices = list(range(train_size, len(concat_dataset)))
+        val_subset = torch.utils.data.Subset(concat_dataset, val_indices)
+        val_sampler = DistributedSampler(
+            val_subset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,  # Don't shuffle validation data
+            drop_last=False
+        )
+        val_dataset = val_subset
+    else:
+        val_sampler = torch.utils.data.SubsetRandomSampler(list(range(train_size, len(concat_dataset)))) if config.shard_type == 0 else None
+        val_dataset = concat_dataset
     
     val_dataloader = DataLoader(
-        concat_dataset,
+        val_dataset,
         batch_size=config.batch_size // 2,
         sampler=val_sampler,
         num_workers=1,
@@ -1288,15 +1476,15 @@ def main():
     # Create optimizer using config values
     # If LoRA is enabled, only optimize LoRA parameters
     if config.lora_rank > 0:
-        model.enable_lora()  # Enable LoRA training
-        print(f"LoRA enabled with rank={config.lora_rank}, alpha={config.lora_alpha}, dropout={config.lora_dropout}")
+        get_model(model).enable_lora()  # Enable LoRA training
+        print_rank0(f"LoRA enabled with rank={config.lora_rank}, alpha={config.lora_alpha}, dropout={config.lora_dropout}")
         optimizer = AdamW(
-            model.get_lora_parameters(),
+            get_model(model).get_lora_parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
             fused=True
         )
-        print(f"Training only {len(model.get_lora_parameters())} LoRA parameters")
+        print_rank0(f"Training only {len(get_model(model).get_lora_parameters())} LoRA parameters")
     else:
         optimizer = AdamW(
             model.parameters(),
@@ -1304,13 +1492,13 @@ def main():
             weight_decay=config.weight_decay,
             fused=True
         )
-        print(f"Training all {sum(p.numel() for p in model.parameters())} parameters")
+        print_rank0(f"Training all {sum(p.numel() for p in model.parameters())} parameters")
 
     # Load checkpoint if --load_checkpoint is enabled and a checkpoint exists
     if args.load_checkpoint:
         latest_checkpoint = find_latest_checkpoint(config.output_dir)
         if latest_checkpoint:
-            print(f"Loading checkpoint from {latest_checkpoint}")
+            print_rank0(f"Loading checkpoint from {latest_checkpoint}")
             checkpoint = torch.load(latest_checkpoint, map_location=config.device)
             
             # Load model state dict
@@ -1322,7 +1510,7 @@ def main():
                 # If model uses LoRA but checkpoint doesn't have LoRA weights, try to load base weights
                 model_state_dict = {k: v for k, v in model_state_dict.items() if 'lora' not in k}
             
-            model.load_state_dict(model_state_dict, strict=False)
+            get_model(model).load_state_dict(model_state_dict, strict=False)
             
             # Load optimizer state if available
             if 'optimizer_state_dict' in checkpoint:
@@ -1330,11 +1518,11 @@ def main():
             
             # Resume from the global step stored in checkpoint
             global_step = checkpoint.get('global_step', 0)
-            print(f"Resuming training from step {global_step}")
+            print_rank0(f"Resuming training from step {global_step}")
         else:
-            print(f"No checkpoint found in {config.output_dir}, starting from scratch")
+            print_rank0(f"No checkpoint found in {config.output_dir}, starting from scratch")
     else:
-        print("Not loading any checkpoint, starting from scratch")
+        print_rank0("Not loading any checkpoint, starting from scratch")
 
     # Training loop
     # Create learning rate scheduler if specified in config
@@ -1363,17 +1551,17 @@ def main():
             num_warmup_steps=warmup_steps,
             num_training_steps=total_training_steps
         )
-        print(f"Using warmup cosine scheduler: {warmup_steps} warmup steps, {total_training_steps} total steps")
+        print_rank0(f"Using warmup cosine scheduler: {warmup_steps} warmup steps, {total_training_steps} total steps")
     elif scheduler_type == 'cosine':
         scheduler = CosineAnnealingLR(optimizer, T_max=total_training_steps)
-        print(f"Using cosine annealing scheduler: {total_training_steps} total steps")
+        print_rank0(f"Using cosine annealing scheduler: {total_training_steps} total steps")
     else:
-        print("Using constant learning rate (no scheduler)")
+        print_rank0("Using constant learning rate (no scheduler)")
 
     # Log model information to wandb
     if wandb_logger is not None:
         # Calculate and log model parameters in millions (M)
-        decoder_param = sum(p.numel() for p in model.decoder.parameters())
+        decoder_param = sum(p.numel() for p in get_model(model).decoder.parameters())
         total_param = sum(p.numel() for p in model.parameters())
         
         model_metrics = {
@@ -1384,22 +1572,26 @@ def main():
         }
         wandb_logger.log_metrics(model_metrics)
         
-        print(f"Number of Decoder Parameters: {decoder_param / 1e6:.2f}M") 
-        print(f"Total Number of Parameters: {total_param / 1e6:.2f}M")
+        print_rank0(f"Number of Decoder Parameters: {decoder_param / 1e6:.2f}M") 
+        print_rank0(f"Total Number of Parameters: {total_param / 1e6:.2f}M")
 
-    print("Starting training...")
+    print_rank0("Starting training...")
 
 
     # Check if torch.compile is available and enabled in config
     enable_torch_compile = train_config.get('enable_torch_compile', False)
+
+    # Disable CUDAGraphs for torch.compile if we have gradient accumulation turned on.
+    use_cudagraphs = config.grad_acc_step == 1
+
     if enable_torch_compile and hasattr(torch, 'compile'):
-        print("Compiling whole model with torch.compile...")
-        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
-        print("Model compilation completed.")
+        print_rank0("Compiling whole model with torch.compile...")
+        model = torch.compile(model, options={"triton.cudagraphs": use_cudagraphs})
+        print_rank0("Model compilation completed.")
     elif enable_torch_compile:
-        print("torch.compile requested but not available in this PyTorch version.")
+        print_rank0("torch.compile requested but not available in this PyTorch version.")
     else:
-        print("torch.compile not enabled in configuration.")
+        print_rank0("torch.compile not enabled in configuration.")
     
     # Calculate total steps for the entire training based on VQ training dataset (larger dataset)
     steps_per_epoch = len(train_dataloader)
@@ -1412,7 +1604,7 @@ def main():
     if args.load_checkpoint:
         latest_checkpoint = find_latest_checkpoint(config.output_dir)
         if latest_checkpoint:
-            print(f"Loading checkpoint from {latest_checkpoint}")
+            print_rank0(f"Loading checkpoint from {latest_checkpoint}")
             checkpoint = torch.load(latest_checkpoint, map_location=config.device)
             
             # Load model state dict
@@ -1424,7 +1616,7 @@ def main():
                 # If model uses LoRA but checkpoint doesn't have LoRA weights, try to load base weights
                 model_state_dict = {k: v for k, v in model_state_dict.items() if 'lora' not in k}
             
-            model.load_state_dict(model_state_dict, strict=False)
+            get_model(model).load_state_dict(model_state_dict, strict=False)
             
             # Load optimizer state if available
             if 'optimizer_state_dict' in checkpoint:
@@ -1442,31 +1634,36 @@ def main():
             resumed_epoch = checkpoint_global_step // steps_per_epoch
             step_in_epoch = checkpoint_global_step % steps_per_epoch
             
-            print(f"Resuming training from global step {checkpoint_global_step}")
-            print(f"This corresponds to epoch {resumed_epoch}, step {step_in_epoch} in that epoch")
-            print(f"Will skip {step_in_epoch} steps in the resumed epoch's dataloader")
+            print_rank0(f"Resuming training from global step {checkpoint_global_step}")
+            print_rank0(f"This corresponds to epoch {resumed_epoch}, step {step_in_epoch} in that epoch")
+            print_rank0(f"Will skip {step_in_epoch} steps in the resumed epoch's dataloader")
             
             # Set the starting global step
             global_step = checkpoint_global_step
         else:
-            print(f"No checkpoint found in {config.output_dir}, starting from scratch")
+            print_rank0(f"No checkpoint found in {config.output_dir}, starting from scratch")
             resumed_epoch = 0
             step_in_epoch = 0
             global_step = 0
     else:
-        print("Not loading any checkpoint, starting from scratch")
+        print_rank0("Not loading any checkpoint, starting from scratch")
         resumed_epoch = 0
         step_in_epoch = 0
         global_step = 0
         
     for epoch in range(resumed_epoch, config.num_epochs):
-        print(f"Epoch {epoch + 1}/{config.num_epochs}")
+        # Set epoch for distributed sampler to ensure proper shuffling
+        # Set epoch for distributed sampler to ensure proper shuffling
+        if hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
+        
+        print_rank0(f"Epoch {epoch + 1}/{config.num_epochs}")
 
         # Determine if this is the first epoch being resumed, and how many steps to skip
         skip_steps = 0
         if epoch == resumed_epoch and step_in_epoch > 0:
             skip_steps = step_in_epoch
-            print(f"Resuming from step {step_in_epoch} in epoch {epoch}, will skip first {skip_steps} steps")
+            print_rank0(f"Resuming from step {step_in_epoch} in epoch {epoch}, will skip first {skip_steps} steps")
 
         start_time = time.time()
         train_loss, steps_completed = train_epoch(
@@ -1489,18 +1686,21 @@ def main():
 
         # Calculate epoch-level perplexity from average loss
         epoch_perplexity = torch.exp(torch.tensor(train_loss))
-        print(f"Epoch {epoch + 1} completed in {epoch_time:.2f}s, Train Loss: {train_loss:.4f}, Train PPL: {epoch_perplexity:.2f}")
+        print_rank0(f"Epoch {epoch + 1} completed in {epoch_time:.2f}s, Train Loss: {train_loss:.4f}, Train PPL: {epoch_perplexity:.2f}")
         # Increment global steps after each epoch
         global_step += steps_completed
         # Reshuffle preloaded varlen dataset after every epoch.
         if config.shard_type > 0:
             concat_dataset.shuffle_order()
     
-    # Log final metrics and finish wandb run
-    if wandb_logger is not None:
+    # Log final metrics and finish wandb run (only on main process)
+    if wandb_logger is not None and is_main_process():
         wandb_logger.finish()
     
-    print("Training completed!")
+    # Clean up distributed training
+    cleanup_distributed()
+    
+    print_rank0("Training completed!")
 
 
 if __name__ == "__main__":

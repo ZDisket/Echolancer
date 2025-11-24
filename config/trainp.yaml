@@ -1,0 +1,76 @@
+# This pretrains Stage 3 (1.5B) on 8xA100 80GB GPUs
+# Training configuration
+mixed_precision: "bf16"  # Options: "fp16", "bf16", "fp8", "none". None will still use TF32 for speed, if the hardware supports it.
+
+# torch.compile configuration
+enable_torch_compile: false  # Whether to use torch.compile for performance
+torch_compile_args:  # Arguments for torch.compile (only used if enable_torch_compile is true)
+  mode: "reduce-overhead"  # Options: "reduce-overhead", "max-autotune", "default"
+  fullgraph: false  # Whether to compile entire forward pass as one graph
+  dynamic: false  # Whether to use dynamic shape tracing
+  
+
+# Hardware specifications
+gpu_flops: 312000000000000 # A100 Tensor Core, no sparsity
+
+optimizer:
+  type: "adamw"
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  eps: 0.000001
+  betas: [0.9, 0.98]
+  grad_clip_thresh: 1.0
+  grad_acc_step: 4
+
+# (0.9, 0.96) fast
+# [0.9, 0.98] pat
+
+scheduler:
+  type: "warmup_cosine"
+  warmup_steps: 2000
+
+loss:
+  pos_weight: 8.0
+
+
+training:
+  batch_size: 16
+  epochs: 3
+  seed: 1234
+  save_step: 75000
+  log_step: 100
+  val_step: 99999999 #15000
+  test_step: 999999999 #15000
+  eval_step: 999999999 #15000
+  seq_len: 1024 # only applicable in pretraining
+
+path:
+  ckpt_path: "./ckpt"
+  log_path: "./logs"
+  result_path: "./results"
+
+# WANDB configuration
+wandb:
+  project: "echolancer"
+  entity: null
+  name: "echolancer-run"
+  notes: "Training Echolancer model"
+  tags: ["text-to-speech", "transformer"]
+  group: "experiment"
+
+# Early stopping
+early_stopping:
+  patience: 10
+  min_delta: 0.001
+
+# Testing configuration
+testing:
+  enabled: true
+  bert_model: "answerdotai/ModernBERT-base"
+  test_sentences: 
+    - "This is a test sentence."
+    - "Another example sentence."
+  test_speakers: [0, 0]
+  # Zero-shot VQ tokens for testing (optional)
+  # test_vq_tokens: null  # Path to VQ tokens for zero-shot testing
+  # test_vq_token_lens: null  # Lengths of VQ token sequences

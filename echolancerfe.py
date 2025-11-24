@@ -20,6 +20,7 @@ class EcholancerFE:
         """
         self.device = torch.device(device)
         self.model = None
+        self.model_dtype = None  # Track the dtype of the loaded model
         self.tokenizer = CharTokenizer()
         self.model_config_path = model_config_path
         
@@ -28,13 +29,15 @@ class EcholancerFE:
     def get_vocab_offset(self):
         return self.tokenizer.get_vocab_size()
     
-    def load_checkpoint(self, checkpoint_path, model_config_path=None, **model_kwargs):
+    def load_checkpoint(self, checkpoint_path, model_config_path=None, dtype_load=None, **model_kwargs):
         """
         Loads a checkpoint into the model.
 
         Args:
             checkpoint_path (str): Path to the checkpoint file (.pt)
             model_config_path (str, optional): Path to model config YAML if not provided in constructor
+            dtype_load (str, optional): Data type for loading model in half precision. 
+                                       Options: "float16" or "bfloat16". Defaults to None (full precision).
             **model_kwargs: Additional arguments to override model parameters
         """
         # Load model configuration if provided
@@ -65,7 +68,10 @@ class EcholancerFE:
         vq_vocab_size = model_kwargs.get('vq_vocab_size', model_params['vq_vocab_size'])
         decoder_kv_heads = model_kwargs.get('decoder_kv_heads', model_params['decoder_kv_heads'])
         pretraining_mode = model_kwargs.get('pretraining_mode', model_params.get('pretraining_mode', True))
+
         zero_shot_mode = model_kwargs.get('zero_shot_mode', model_params.get('zero_shot_mode', False))
+        use_macaron = model_kwargs.get('use_macaron', model_params.get('use_macaron', False))
+
         
         # Create the model with parameters
         text_vocab_size = self.get_vocab_offset()
@@ -96,7 +102,9 @@ class EcholancerFE:
             lora_alpha=model_kwargs.get('lora_alpha', 16),
             lora_dropout=model_kwargs.get('lora_dropout', 0.0),
             lora_scale=model_kwargs.get('lora_scale', 1.0),
+
             zero_shot_mode=zero_shot_mode,
+            use_macaron=use_macaron,
         )
         
         # Load the checkpoint
@@ -119,6 +127,22 @@ class EcholancerFE:
         
         # Load state dict
         self.model.load_state_dict(cleaned_state_dict, strict=False)
+        
+        # Apply dtype conversion if specified
+        if dtype_load is not None:
+            if dtype_load.lower() == "float16":
+                self.model = self.model.half()  # Convert to float16
+                self.model_dtype = torch.float16
+                print(f"Model converted to float16 precision")
+            elif dtype_load.lower() == "bfloat16":
+                self.model = self.model.to(torch.bfloat16)  # Convert to bfloat16
+                self.model_dtype = torch.bfloat16
+                print(f"Model converted to bfloat16 precision")
+            else:
+                raise ValueError(f"Invalid dtype_load: {dtype_load}. Must be 'float16' or 'bfloat16'")
+        else:
+            self.model_dtype = torch.float32  # Default to float32
+        
         self.model = self.model.to(self.device)
         self.model.eval()
         
@@ -155,13 +179,20 @@ class EcholancerFE:
         # 3) Convert to tensor and batch it (1, L)
         text_input = torch.tensor(inp_seq, dtype=torch.long, device=self.device).unsqueeze(0)
         
+        # Move text_input to model dtype if using half precision
+        # Note: text_input is long dtype (token IDs), so we keep it as is
+        # The model's embedding layer will handle the conversion
+        
         # Prepare speaker tensor if needed
         if speaker_id is not None:
             if isinstance(speaker_id, torch.Tensor):
                 # If speaker_id is already a tensor (e.g., speaker embedding in zero-shot mode)
+                # Convert to model dtype if it's a float tensor
                 speaker_tensor = speaker_id.to(self.device)
+                if speaker_tensor.dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                    speaker_tensor = speaker_tensor.to(dtype=self.model_dtype)
             else:
-                # If speaker_id is an integer ID
+                # If speaker_id is an integer ID (long dtype, no conversion needed)
                 speaker_tensor = torch.tensor([speaker_id], dtype=torch.long, device=self.device)
         else:
             speaker_tensor = None

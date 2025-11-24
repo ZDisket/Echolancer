@@ -1,24 +1,27 @@
+# Takes 2.5 days to train on 8xA100 80GB
 # Model configuration
+
 model:
   name: "echolancer"
   vocab_size: 43 # Unused
   emotion_channels: 0
-  speaker_channels: 192
-  multi_speaker: True
+  speaker_channels: 0
+  multi_speaker: False
   n_speaker: 0
   use_alibi: True
   alibi_alpha: 1.0
   activation: "gelu"
   vq_token_mode: False  # Enable zero-shot mode with VQ tokens
-  zero_shot_mode: True # Enable zero shot mode with external embedder.
+  zero_shot_mode: False # Enable zero shot mode with external embedder.
   vq_vocab_size: 65536   # Audio vocab size. NeuCodec.
-  decoder_kv_heads: 5  # Number of key/value heads for decoder GQA (null = MHA)
+  decoder_kv_heads: 6  # Number of key/value heads for decoder GQA (null = MHA)
   use_macaron: False
 
+
   decoder:
-    hidden: 1280
-    head: 20
-    layer: 27
+    hidden: 1536
+    head: 24
+    layer: 48
     dropout: 0.05
     forward_expansion: 4
 

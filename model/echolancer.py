@@ -775,14 +775,24 @@ class TransformerEncoder(nn.Module):
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout, alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None, start_i_increment=0,
                  cross_attn_type="full", disable_cross_attn=False, use_te=False, d_cond=0, 
-                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0):
+                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
         super(TransformerDecoderLayer, self).__init__()
         self.disable_cross_attn = disable_cross_attn  # Option to disable cross attention
         self.use_te = use_te
+        self.use_macaron = use_macaron
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.lora_scale = lora_scale
+        self.ffn_scale = 1.0
+        
+        if self.use_macaron:
+            d_ff = d_ff // 2 # halven FFN scale so that we have the same amount of parameters
+            self.ffn0 = FeedForward(d_model, d_ff, dropout, activation, d_cond=0, use_te=use_te,
+                                           lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale)
+            self.norm0 = AdaLayerNorm(d_model, cond_dim=d_cond)
+            self.ffn_scale = 0.5
+
         
         self.self_attn = MultiHeadAttention(d_model, num_heads, 0.0, alibi_alpha, use_alibi, use_combined_linear=True,
                                           num_kv_heads=num_kv_heads, start_i_increment=start_i_increment, causal=True, use_te=use_te, 
@@ -818,6 +828,13 @@ class TransformerDecoderLayer(nn.Module):
     def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask):
         # 1. Self-attention (pre-norm)
         residual = x
+        
+        if self.use_macaron:
+            x = self.norm0(x, cond=cond)
+            x = self.ffn0(x, ffn_seq_mask, cond=cond)
+            x = residual + self.ffn_scale * x
+            residual = x
+
         x = self.norm1(x, cond=cond)  # PRE-norm
         if self.disable_cross_attn:  # keep the bug-fix comment #1
             self_attn_mask = None
@@ -839,8 +856,8 @@ class TransformerDecoderLayer(nn.Module):
         residual = x
         x = self.norm3(x, cond=cond)  # PRE-norm
         x = self.ffn(x, ffn_seq_mask, cond=cond)
-        x = residual + x
 
+        x = residual + self.ffn_scale * x
 
         return x
 
@@ -848,7 +865,7 @@ class TransformerDecoderLayer(nn.Module):
 
 class TransformerDecoder(nn.Module):
     def __init__(self, d_model, num_heads, num_layers, d_ff, dropout, alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None,
-                 start_i=0, disable_cross_attn=False, use_te=False, d_cond=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0):
+                 start_i=0, disable_cross_attn=False, use_te=False, d_cond=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
         super(TransformerDecoder, self).__init__()
         self.use_te = use_te
 
@@ -870,7 +887,7 @@ class TransformerDecoder(nn.Module):
                                    start_i_increment=start_i + ((i * num_heads) // alibi_scaling_fac),
                                    disable_cross_attn=disable_cross_attn,
                                    use_te=use_te, cross_attn_type="full", d_cond=d_cond,
-                                   lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale)
+                                   lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale, use_macaron=use_macaron)
             for i in range(num_layers)
         ])
         self.disable_cross_attn = disable_cross_attn
@@ -934,7 +951,7 @@ class TextEncoder(nn.Module):
 class AudioDecoderAR(nn.Module):
     def __init__(self, encoder_channels, codebook_size, filter_channels, depth, heads, dropout=0.1,
                  speaker_channels=0, dec_type="transformer", alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None, start_i=0,
-                 pretraining_mode=False, use_te=False, vocab_offset=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0):
+                 pretraining_mode=False, use_te=False, vocab_offset=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
         super().__init__()
 
         self.encoder_channels = encoder_channels
@@ -972,7 +989,7 @@ class AudioDecoderAR(nn.Module):
             self.dec = TransformerDecoder(filter_channels, heads, depth,
                                         filter_channels * 4, dropout, alibi_alpha, use_alibi, activation, num_kv_heads, start_i,
                                         disable_cross_attn=True, use_te=use_te, d_cond=speaker_channels,
-                                        lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale)
+                                        lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale, use_macaron=use_macaron)
 
             self.out_proj = None
         else:
@@ -1157,7 +1174,7 @@ class Echolancer(nn.Module):
                  decoder_kv_heads=None, decoder_start_i=0,
                  emotion_input_size=768, emotion_hidden_sizes=[512, 384], emotion_dropout=0.1,
                  pretraining_mode=False, use_te=False, zero_shot_mode=False,
-                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0):
+                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
         super(Echolancer, self).__init__()
         self.emotion_channels = emotion_channels
         self.speaker_channels = speaker_channels
@@ -1209,6 +1226,7 @@ class Echolancer(nn.Module):
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             lora_scale=lora_scale,
+            use_macaron=use_macaron,
         )
 
         self.combined_vocab_size = vocab_size + self.decoder.n_embeds # decoder adds special tokens.
