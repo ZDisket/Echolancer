@@ -1,0 +1,13 @@
+# Requirements for running Echolancer Zero-Shot TTS Demo
+# Optimized for HuggingFace Spaces
+
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+gradio>=4.0.0
+speechbrain>=1.0.0
+pyyaml>=6.0
+numpy>=1.24.0
+scipy>=1.10.0
+tqdm>=4.65.0
+neucodec

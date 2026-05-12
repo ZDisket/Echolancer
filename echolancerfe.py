@@ -71,6 +71,9 @@ class EcholancerFE:
 
         zero_shot_mode = model_kwargs.get('zero_shot_mode', model_params.get('zero_shot_mode', False))
         use_macaron = model_kwargs.get('use_macaron', model_params.get('use_macaron', False))
+        use_canon_a = model_kwargs.get('use_canon_a', model_params.get('use_canon_a', False))
+        use_canon_c = model_kwargs.get('use_canon_c', model_params.get('use_canon_c', False))
+        canon_kernel_size = model_kwargs.get('canon_kernel_size', model_params.get('canon_kernel_size', 4))
 
         
         # Create the model with parameters
@@ -105,6 +108,9 @@ class EcholancerFE:
 
             zero_shot_mode=zero_shot_mode,
             use_macaron=use_macaron,
+            use_canon_a=use_canon_a,
+            use_canon_c=use_canon_c,
+            canon_kernel_size=canon_kernel_size,
         )
         
         # Load the checkpoint

@@ -15,6 +15,9 @@ model:
   encoder_kv_heads: 4  # Number of key/value heads for encoder GQA (null = MHA)
   decoder_kv_heads: 4  # Number of key/value heads for decoder GQA (null = MHA)
   use_macaron: False
+  use_canon_a: False      # Canon layer before self-attention
+  use_canon_c: False      # Canon layer before FFN
+  canon_kernel_size: 4    # Kernel size for Canon convolutions
 
   decoder:
     hidden: 1024

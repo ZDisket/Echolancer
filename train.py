@@ -1341,6 +1341,9 @@ def main():
         lora_scale=config.lora_scale,
         zero_shot_mode=model_params['zero_shot_mode'],
         use_macaron=model_params['use_macaron'],
+        use_canon_a=model_params.get('use_canon_a', False),
+        use_canon_c=model_params.get('use_canon_c', False),
+        canon_kernel_size=model_params.get('canon_kernel_size', 4),
     )
 
     if args.pretrained is not None and is_main_process():

@@ -5,9 +5,9 @@ model:
   name: "echolancer"
   vocab_size: 43 # Unused
   emotion_channels: 0
-  speaker_channels: 0
-  multi_speaker: False
-  n_speaker: 0
+  speaker_channels: 256
+  multi_speaker: True
+  n_speaker: 43
   use_alibi: True
   alibi_alpha: 1.0
   activation: "gelu"
@@ -16,16 +16,16 @@ model:
   vq_vocab_size: 65536   # Audio vocab size. NeuCodec.
   decoder_kv_heads: 6  # Number of key/value heads for decoder GQA (null = MHA)
   use_macaron: False
-  use_canon_a: False      # Canon layer before self-attention
-  use_canon_c: False      # Canon layer before FFN
-  canon_kernel_size: 4    # Kernel size for Canon convolutions
+  use_canon_a: True      # Canon layer before self-attention
+  use_canon_c: True      # Canon layer before FFN
+  canon_kernel_size: 4   # Kernel size for Canon convolutions
 
 
   decoder:
     hidden: 1536
     head: 24
     layer: 48
-    dropout: 0.05
+    dropout: 0.1
     forward_expansion: 4
 
 

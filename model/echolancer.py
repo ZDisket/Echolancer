@@ -6,10 +6,21 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import math
 try:
     from flash_attn import flash_attn_func, flash_attn_qkvpacked_func, flash_attn_varlen_func
+    from flash_attn import flash_attn_with_kvcache
     FLASH_AVAILABLE = True
+    FLASH_KVCACHE_AVAILABLE = True
 except ImportError:
     FLASH_AVAILABLE = False
+    FLASH_KVCACHE_AVAILABLE = False
     print("WARNING: Flash Attention not available! Falling back to manual attention.")
+
+try:
+    # Fallback: flash_attn might be available but not kvcache (older versions)
+    if FLASH_AVAILABLE and not FLASH_KVCACHE_AVAILABLE:
+        from flash_attn import flash_attn_with_kvcache
+        FLASH_KVCACHE_AVAILABLE = True
+except ImportError:
+    pass
 
 if FLASH_AVAILABLE:
     try:
@@ -93,6 +104,31 @@ class CausalConv1d(nn.Module):
         x = self.dropout(x)
         return x
 
+
+class NoOpCanon(nn.Module):
+    """No-op placeholder that matches CanonLayer signature."""
+    def forward(self, x, mask=None):
+        return torch.zeros_like(x)
+
+
+class CanonLayer(nn.Module):
+    """Causal depthwise convolution branch for local token mixing."""
+    def __init__(self, dim, kernel_size=4):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False)
+        nn.init.zeros_(self.conv.weight)
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x, mask=None):
+        if mask is not None:
+            x = x.masked_fill(mask.unsqueeze(-1), 0.0)
+        x_perm = x.transpose(1, 2)  # (B, D, T)
+        x_pad = F.pad(x_perm, (self.kernel_size - 1, 0))  # causal padding
+        out = self.conv(x_pad).transpose(1, 2)  # (B, T, D)
+        if mask is not None:
+            out = out.masked_fill(mask.unsqueeze(-1), 0.0)
+        return self.scale * out
 
 
 class AdaLayerNorm(nn.Module):
@@ -452,7 +488,7 @@ class SimpleCrossAttention(nn.Module):
         x = self.W_o(x)                           # (B, T_q, d_model)
 
         # Cast logprobs back to compute dtype to match expectations
-        return x, attn_logprobs.to(scores.dtype)
+        return x, attn_logprobs.to(scores.dtype), None
 
 
 # Attention modules (simplified versions)
@@ -473,6 +509,7 @@ class MultiHeadAttention(nn.Module):
         self.backend = "flash" if FLASH_AVAILABLE else "manual"
         self.causal = causal
         self.use_te = use_te
+        self._is_export = False  # ONNX export mode
 
         # LoRA parameters
         self.lora_rank = lora_rank
@@ -503,6 +540,14 @@ class MultiHeadAttention(nn.Module):
         if self.use_alibi:
             self.register_buffer('alibi_slopes', self._get_alibi_slopes(start_i_increment))
 
+    @property
+    def is_export(self):
+        return self._is_export
+
+    @is_export.setter
+    def is_export(self, value):
+        self._is_export = value
+
     def _get_alibi_slopes(self, start_i_increment=0):
         """
         Get the slopes for ALiBi attention biases with layer scaling.
@@ -531,7 +576,13 @@ class MultiHeadAttention(nn.Module):
         bias = slopes * (k_idx - q_idx)  # (1,H,Tq,Tk), typically <= 0 on/left of diagonal
         return bias  # fp32
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, kv_cache="NOT_PROVIDED", cache_seqlens="NOT_PROVIDED"):
+        if kv_cache != "NOT_PROVIDED" or cache_seqlens != "NOT_PROVIDED":
+            # Call forward_with_kvcache if either was provided
+            real_kv_cache = None if kv_cache == "NOT_PROVIDED" else kv_cache
+            real_cache_seqlens = None if cache_seqlens == "NOT_PROVIDED" else cache_seqlens
+            return self.forward_with_kvcache(query, key=key, value=value, kv_cache=real_kv_cache, cache_seqlens=real_cache_seqlens)
+
         batch_size = query.size(0)
         seq_len_q = query.size(1)
         seq_len_k = key.size(1)
@@ -558,9 +609,9 @@ class MultiHeadAttention(nn.Module):
         else:
             x = self._forward_manual(K, Q, V, batch_size, mask, seq_len_k, seq_len_q)
 
-        # For self-attention in transformer blocks, only return the attention output,
-        # not a tuple with logprobs (that's used only for cross-attention)
-        return x
+        # For self-attention in transformer blocks, return the attention output,
+        # and None for KV cache values if not used.
+        return x, None, None
 
     def _forward_manual(self, K, Q, V, batch_size, mask, seq_len_k, seq_len_q):
         """
@@ -725,6 +776,177 @@ class MultiHeadAttention(nn.Module):
         out = self.W_o(out)  # (B, T_q, d_model)
         return out
 
+    def forward_with_kvcache(self, query, key=None, value=None, kv_cache=None, cache_seqlens=None):
+        """
+        Forward pass with KV cache for efficient autoregressive inference.
+        
+        Args:
+            query: Input tensor (B, T_new, d_model) - typically T_new=1 for incremental decoding
+            key: Optional input tensor for K projection (B, T_new, d_model)
+            value: Optional input tensor for V projection (B, T_new, d_model)
+            kv_cache: Tuple of (k_cache, v_cache) each with shape (B, max_seq_len, num_kv_heads, d_k)
+                      or None for first step
+            cache_seqlens: Tensor (B,) indicating current sequence lengths in cache, or None
+            
+        Returns:
+            output: Attention output (B, T_new, d_model)
+            new_kv_cache: Updated (k_cache, v_cache) tuple
+            new_cache_seqlens: Updated sequence lengths
+        """
+        batch_size = query.size(0)
+        seq_len_new = query.size(1)
+        device = query.device
+        dtype = query.dtype
+        
+        # Use query if key/value are not provided (self-attention)
+        if key is None: key = query
+        if value is None: value = query
+
+        # Project query, key, value for new tokens
+        Q = self.W_q(query)  # (B, T_new, d_model)
+        K_new = self.W_k(key)  # (B, T_new, num_kv_heads * d_k)
+        V_new = self.W_v(value)  # (B, T_new, num_kv_heads * d_k)
+        
+        # Reshape for attention: (B, T_new, num_heads/num_kv_heads, d_k)
+        Q = Q.view(batch_size, seq_len_new, self.num_heads, self.d_k)
+        K_new = K_new.view(batch_size, seq_len_new, self.num_kv_heads, self.d_k)
+        V_new = V_new.view(batch_size, seq_len_new, self.num_kv_heads, self.d_k)
+        
+        # Initialize or update KV cache
+        if kv_cache is None:
+            # First step: initialize cache with reasonable max length
+            max_cache_len = 2048  # Default max length, will expand if needed
+            k_cache = torch.zeros(batch_size, max_cache_len, self.num_kv_heads, self.d_k, 
+                                  device=device, dtype=dtype)
+            v_cache = torch.zeros(batch_size, max_cache_len, self.num_kv_heads, self.d_k,
+                                  device=device, dtype=dtype)
+            cache_seqlens = torch.zeros(batch_size, device=device, dtype=torch.int32)
+        else:
+            k_cache, v_cache = kv_cache
+            # Expand cache if needed
+            if cache_seqlens.max() + seq_len_new > k_cache.size(1):
+                if self._is_export:
+                    raise RuntimeError("KV cache overflow in export mode. Pre-allocate a larger cache buffer.")
+                new_max_len = k_cache.size(1) * 2
+                new_k_cache = torch.zeros(batch_size, new_max_len, self.num_kv_heads, self.d_k,
+                                          device=device, dtype=dtype)
+                new_v_cache = torch.zeros(batch_size, new_max_len, self.num_kv_heads, self.d_k,
+                                          device=device, dtype=dtype)
+                new_k_cache[:, :k_cache.size(1)] = k_cache
+                new_v_cache[:, :v_cache.size(1)] = v_cache
+                k_cache = new_k_cache
+                v_cache = new_v_cache
+        
+        # Use flash_attn_with_kvcache if available (most efficient)
+        if FLASH_KVCACHE_AVAILABLE and self.backend == "flash":
+            # Get ALiBi slopes if used
+            alibi = None
+            if self.use_alibi:
+                alibi = self.alibi_slopes.to(device=device, dtype=torch.float32)
+            
+            # flash_attn_with_kvcache updates cache in-place and returns attention output
+            out = flash_attn_with_kvcache(
+                q=Q.bfloat16(),
+                k_cache=k_cache.bfloat16(),
+                v_cache=v_cache.bfloat16(),
+                k=K_new.bfloat16(),
+                v=V_new.bfloat16(),
+                cache_seqlens=cache_seqlens,
+                causal=self.causal,
+                alibi_slopes=alibi,
+            )  # (B, T_new, num_heads, d_k)
+            
+            # Update sequence lengths
+            new_cache_seqlens = cache_seqlens + seq_len_new
+            
+            # Reshape and project output
+            out = out.to(dtype=dtype)
+            out = out.reshape(batch_size, seq_len_new, self.d_model)
+            out = self.W_o(out)
+            
+            # Note: k_cache and v_cache were updated in-place by flash_attn_with_kvcache
+            return out, (k_cache.to(dtype), v_cache.to(dtype)), new_cache_seqlens
+        
+        else:
+            # Manual fallback: update cache and compute attention
+            # Update cache with new K, V
+            if self._is_export:
+                # ONNX-friendly: vectorized cache update using scatter
+                # Build write positions: (B, T_new, 1, 1) broadcast to (B, T_new, H, D)
+                seq_offsets = torch.arange(seq_len_new, device=device, dtype=cache_seqlens.dtype).view(1, -1, 1, 1)
+                write_positions = cache_seqlens.view(-1, 1, 1, 1) + seq_offsets  # (B, T_new, 1, 1)
+                write_positions = write_positions.expand(-1, -1, self.num_kv_heads, self.d_k)  # (B, T_new, H, D)
+                
+                k_cache.scatter_(1, write_positions, K_new)
+                v_cache.scatter_(1, write_positions, V_new)
+            else:
+                # Original Python loop (faster in eager mode)
+                for b in range(batch_size):
+                    start_idx = cache_seqlens[b].item()
+                    end_idx = start_idx + seq_len_new
+                    k_cache[b, start_idx:end_idx] = K_new[b]
+                    v_cache[b, start_idx:end_idx] = V_new[b]
+            
+            new_cache_seqlens = cache_seqlens + seq_len_new
+            
+            # Get max_seq_len - avoid .item() in export mode
+            if self._is_export:
+                max_seq_len = new_cache_seqlens.max()  # Keep as tensor
+            else:
+                max_seq_len = new_cache_seqlens.max().item()
+            
+            # Get valid K, V from cache: (B, max_seq_len, num_kv_heads, d_k)
+            K_full = k_cache[:, :max_seq_len]
+            V_full = v_cache[:, :max_seq_len]
+            
+            # Transpose for attention: (B, num_heads/num_kv_heads, T, d_k)
+            Q_t = Q.transpose(1, 2)  # (B, num_heads, T_new, d_k)
+            K_t = K_full.transpose(1, 2)  # (B, num_kv_heads, max_seq_len, d_k)
+            V_t = V_full.transpose(1, 2)  # (B, num_kv_heads, max_seq_len, d_k)
+            
+            # GQA expansion
+            if self.num_kv_heads != self.num_heads:
+                K_t = K_t.repeat_interleave(self.num_query_groups, dim=1)
+                V_t = V_t.repeat_interleave(self.num_query_groups, dim=1)
+            
+            # Compute attention scores
+            d_k = self.d_k
+            scores = torch.matmul(Q_t, K_t.transpose(-2, -1))  # (B, H, T_new, max_seq_len)
+            scale = 1.0 / (d_k ** 0.5)
+            scores = (scores * scale).float()
+            
+            # ALiBi bias
+            if self.use_alibi:
+                # Per-batch ALiBi bias calculation for variable sequence lengths
+                k_idx = torch.arange(max_seq_len, device=device, dtype=torch.float32).view(1, 1, 1, -1)
+                q_idx = torch.arange(seq_len_new, device=device, dtype=torch.float32).view(1, 1, -1, 1)
+                
+                # Add batch-specific query offset: (B, 1, 1, 1)
+                q_pos_offset = (new_cache_seqlens - seq_len_new).view(-1, 1, 1, 1).to(torch.float32)
+                q_idx = q_idx + q_pos_offset
+                
+                slopes = self.alibi_slopes.view(1, self.num_heads, 1, 1).to(dtype=torch.float32)
+                alibi_bias = slopes * (k_idx - q_idx) # (B, H, T_new, max_seq_len)
+                scores = scores + alibi_bias
+
+            # Causal mask: query at position q can attend to keys at positions <= q
+            if self.causal:
+                # Create mask for incremental positions
+                q_pos = torch.arange(seq_len_new, device=device).view(1, 1, -1, 1)
+                q_pos = q_pos + (new_cache_seqlens - seq_len_new).view(-1, 1, 1, 1)  # Add offset per batch
+                k_pos = torch.arange(max_seq_len, device=device).view(1, 1, 1, -1)
+                causal_mask = q_pos >= k_pos  # (B, 1, T_new, max_seq_len)
+                neg_inf = torch.finfo(torch.float32).min
+                scores = scores.masked_fill(~causal_mask, neg_inf)
+            
+            # Softmax and apply attention
+            attn = torch.softmax(scores, dim=-1).to(Q.dtype)
+            out = torch.matmul(attn, V_t)  # (B, H, T_new, d_k)
+            out = out.transpose(1, 2).contiguous().view(batch_size, seq_len_new, self.d_model)
+            out = self.W_o(out)
+            
+            return out, (k_cache, v_cache), new_cache_seqlens
+
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout, alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None, start_i_increment=0, use_te=False):
@@ -741,7 +963,7 @@ class TransformerEncoderLayer(nn.Module):
         # 1. Self-attention (pre-norm)
         residual = x
         x = self.norm1(x)  # PRE-norm
-        x = self.self_attn(x, x, x, attn_mask)
+        x, _, _ = self.self_attn(x, x, x, attn_mask)
         x = residual + self.dropout(x)
 
         # 2. Feed-forward (pre-norm)
@@ -750,7 +972,7 @@ class TransformerEncoderLayer(nn.Module):
         x = self.ffn(x, seq_mask)
         x = residual + self.dropout(x)
 
-        return x
+        return x, None, None
 
 class TransformerEncoder(nn.Module):
     def __init__(self, d_model, num_heads, num_layers, d_ff, dropout, alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None, start_i=0, use_te=False):
@@ -769,13 +991,14 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x, attn_mask, seq_mask):
         for layer in self.layers:
-            x = layer(x, attn_mask, seq_mask)
-        return x
+            x, _, _ = layer(x, attn_mask, seq_mask)
+        return x, None, None
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout, alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None, start_i_increment=0,
                  cross_attn_type="full", disable_cross_attn=False, use_te=False, d_cond=0, 
-                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
+                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False,
+                 use_canon_a=False, use_canon_c=False, canon_kernel_size=4):
         super(TransformerDecoderLayer, self).__init__()
         self.disable_cross_attn = disable_cross_attn  # Option to disable cross attention
         self.use_te = use_te
@@ -784,7 +1007,14 @@ class TransformerDecoderLayer(nn.Module):
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.lora_scale = lora_scale
+        self._is_export = False
         self.ffn_scale = 1.0
+        self.use_canon_a = use_canon_a
+        self.use_canon_c = use_canon_c
+
+        # Canon layers for local token mixing
+        self.canon_a = CanonLayer(d_model, canon_kernel_size) if self.use_canon_a else None
+        self.canon_c = CanonLayer(d_model, canon_kernel_size) if self.use_canon_c else None
         
         if self.use_macaron:
             d_ff = d_ff // 2 # halven FFN scale so that we have the same amount of parameters
@@ -825,7 +1055,18 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.last_logprobs = None
 
-    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask):
+    @property
+    def is_export(self):
+        return self._is_export
+
+    @is_export.setter
+    def is_export(self, value):
+        self._is_export = value
+        self.self_attn.is_export = value
+        if hasattr(self.cross_attn, 'is_export'):
+            self.cross_attn.is_export = value
+
+    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask, kv_cache=None, cache_seqlens=None):
         # 1. Self-attention (pre-norm)
         residual = x
         
@@ -835,37 +1076,50 @@ class TransformerDecoderLayer(nn.Module):
             x = residual + self.ffn_scale * x
             residual = x
 
-        x = self.norm1(x, cond=cond)  # PRE-norm
+        normed = self.norm1(x, cond=cond)  # PRE-norm
+        if self.use_canon_a:
+            x = residual + self.canon_a(normed, ffn_seq_mask)
+            residual = x
+
         if self.disable_cross_attn:  # keep the bug-fix comment #1
             self_attn_mask = None
 
-        x = self.self_attn(x, x, x, self_attn_mask)  # Always returns a tuple (output, logprobs_or_none)
+        x, new_kv_cache, new_cache_seqlens = self.self_attn(normed, normed, normed, self_attn_mask, kv_cache=kv_cache, cache_seqlens=cache_seqlens)
         x = residual + x
 
         # 2. Cross-attention (pre-norm)
         if not self.disable_cross_attn:
             residual = x
             x = self.norm2(x)  # PRE-norm
-            x, attn_logprobs = self.cross_attn(x, memory, memory, cross_attn_mask)
+            
+            x, logprobs_or_new_kv, maybe_seqlens = self.cross_attn(x, memory, memory, cross_attn_mask)
             x = residual + x
 
-            self.last_logprobs = attn_logprobs
-
+            # If cross_attn is MultiHeadAttention, logprobs_or_new_kv is None
+            # If cross_attn is SimpleCrossAttention, it is attn_logprobs
+            if isinstance(self.cross_attn, SimpleCrossAttention):
+                self.last_logprobs = logprobs_or_new_kv
 
         # 3. Feed-forward (pre-norm)
         residual = x
-        x = self.norm3(x, cond=cond)  # PRE-norm
-        x = self.ffn(x, ffn_seq_mask, cond=cond)
+
+        normed = self.norm3(x, cond=cond)  # PRE-norm
+        if self.use_canon_c:
+            x = residual + self.canon_c(normed, ffn_seq_mask)
+            residual = x
+
+        x = self.ffn(normed, ffn_seq_mask, cond=cond)
 
         x = residual + self.ffn_scale * x
 
-        return x
+        return x, new_kv_cache, new_cache_seqlens
 
 
 
 class TransformerDecoder(nn.Module):
     def __init__(self, d_model, num_heads, num_layers, d_ff, dropout, alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None,
-                 start_i=0, disable_cross_attn=False, use_te=False, d_cond=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
+                 start_i=0, disable_cross_attn=False, use_te=False, d_cond=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False,
+                 use_canon_a=False, use_canon_c=False, canon_kernel_size=4):
         super(TransformerDecoder, self).__init__()
         self.use_te = use_te
 
@@ -880,6 +1134,7 @@ class TransformerDecoder(nn.Module):
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.lora_scale = lora_scale
+        self._is_export = False
 
         self.layers = nn.ModuleList([
             TransformerDecoderLayer(d_model, num_heads, d_ff, dropout, alibi_alpha, 
@@ -887,15 +1142,35 @@ class TransformerDecoder(nn.Module):
                                    start_i_increment=start_i + ((i * num_heads) // alibi_scaling_fac),
                                    disable_cross_attn=disable_cross_attn,
                                    use_te=use_te, cross_attn_type="full", d_cond=d_cond,
-                                   lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale, use_macaron=use_macaron)
+                                   lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale, use_macaron=use_macaron,
+                                   use_canon_a=use_canon_a, use_canon_c=use_canon_c, canon_kernel_size=canon_kernel_size)
             for i in range(num_layers)
         ])
         self.disable_cross_attn = disable_cross_attn
 
-    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask=None, ffn_seq_mask=None):
+    @property
+    def is_export(self):
+        return self._is_export
+
+    @is_export.setter
+    def is_export(self, value):
+        self._is_export = value
         for layer in self.layers:
-            x = layer(x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask)
-        return x
+            layer.is_export = value
+
+    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask=None, ffn_seq_mask=None, kv_caches=None, cache_seqlens=None):
+        new_kv_caches = []
+        new_seqlens = cache_seqlens 
+        
+        for i, layer in enumerate(self.layers):
+            layer_kv_cache = kv_caches[i] if kv_caches is not None else None
+            # Pass original cache_seqlens to each layer, but collect outputs
+            x, new_cache, layer_new_seqlens = layer(x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask, 
+                                               kv_cache=layer_kv_cache, cache_seqlens=cache_seqlens)
+            new_kv_caches.append(new_cache)
+            new_seqlens = layer_new_seqlens
+            
+        return x, new_kv_caches, new_seqlens
 
 # Model components
 # Unused for now
@@ -936,7 +1211,9 @@ class TextEncoder(nn.Module):
         attn_mask = expand_self_attention_mask(x_mask)
         
         # Pass both attention mask and sequence mask to transformer encoder
-        x = self.encoder(x, attn_mask, x_mask)
+        x, _, _ = self.encoder(x, attn_mask, x_mask)
+        
+        return x, None, None
 
         # In pretraining mode with MLM, return logits for masked positions
         if self.pretraining_mode and mlm_mask is not None:
@@ -951,7 +1228,8 @@ class TextEncoder(nn.Module):
 class AudioDecoderAR(nn.Module):
     def __init__(self, encoder_channels, codebook_size, filter_channels, depth, heads, dropout=0.1,
                  speaker_channels=0, dec_type="transformer", alibi_alpha=1.0, use_alibi=False, activation='relu', num_kv_heads=None, start_i=0,
-                 pretraining_mode=False, use_te=False, vocab_offset=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
+                 pretraining_mode=False, use_te=False, vocab_offset=0, lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False,
+                 use_canon_a=False, use_canon_c=False, canon_kernel_size=4):
         super().__init__()
 
         self.encoder_channels = encoder_channels
@@ -981,6 +1259,7 @@ class AudioDecoderAR(nn.Module):
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.lora_scale = lora_scale
+        self._is_export = False
 
         self.spk_cond = None
         if self.dec_type == "transformer":
@@ -989,7 +1268,8 @@ class AudioDecoderAR(nn.Module):
             self.dec = TransformerDecoder(filter_channels, heads, depth,
                                         filter_channels * 4, dropout, alibi_alpha, use_alibi, activation, num_kv_heads, start_i,
                                         disable_cross_attn=True, use_te=use_te, d_cond=speaker_channels,
-                                        lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale, use_macaron=use_macaron)
+                                        lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_scale=lora_scale, use_macaron=use_macaron,
+                                        use_canon_a=use_canon_a, use_canon_c=use_canon_c, canon_kernel_size=canon_kernel_size)
 
             self.out_proj = None
         else:
@@ -998,7 +1278,16 @@ class AudioDecoderAR(nn.Module):
         self.gate_proj = nn.Identity()  # no sigmoid, we use BCEWithLogitsLoss
         self.g_drop = nn.Dropout(0.1)
 
-    def forward(self, x, x_mask, y=None, y_mask=None, spk_emb=None):
+    @property
+    def is_export(self):
+        return self._is_export
+
+    @is_export.setter
+    def is_export(self, value):
+        self._is_export = value
+        self.dec.is_export = value
+
+    def forward(self, x, x_mask, y=None, y_mask=None, spk_emb=None, kv_cache=None, cache_seqlens=None):
         """
         Autoregressive next-token prediction for discrete token generation.
         
@@ -1008,14 +1297,14 @@ class AudioDecoderAR(nn.Module):
             y: Encoded text representations (B, seq_len_y, d_model), or None in pretraining mode
             y_mask: Boolean mask (B, seq_len_y) where True indicates padded positions, or None in pretraining mode
             spk_emb: Speaker embedding (B, 1, speaker_channels) or None
-
+            kv_cache: Optional list of KV caches for transformer layers
+            cache_seqlens: Optional tensor of sequence lengths for KV cache
+            
         Returns:
             Tuple containing:
                 - indices_pred: Predicted token logits (B, seq_len_x-1, vocab_size)
-                - gate_pred: Gate predictions (B, seq_len_x-1, 1)
-                - attn_logprob: Attention log probabilities (B, 1, seq_len_x-1, seq_len_y) or zeros in pretraining
-                - x_mask_in: Input mask for decoder (B, seq_len_x-1)
-                - hidden_out: Decoder hidden states (B, seq_len_x-1, d_model)
+                - kv_cache: Updated KV cache list
+                - cache_seqlens: Updated cache sequence lengths
         """
         B, L = x.size()
 
@@ -1031,12 +1320,13 @@ class AudioDecoderAR(nn.Module):
 
         # Decoder forward pass
         if self.decoder_type == "transformer":
-            dec_out = self.dec(x, None, spk_emb, self_attn_mask, None)
+            dec_out, new_kv_cache, new_cache_seqlens = self.dec(x, None, spk_emb, self_attn_mask, None, 
+                                                               kv_caches=kv_cache, cache_seqlens=cache_seqlens)
             
             # Final projection
             indices_pred = self.out_proj(dec_out)  # (B, L-1, vocab_size)
             
-            return indices_pred
+            return indices_pred, new_kv_cache, new_cache_seqlens
 
 
     def infer(self, max_length=1000, spk_emb=None, temperature=0.8, top_p=1.0, input_tokens=None):
@@ -1174,7 +1464,8 @@ class Echolancer(nn.Module):
                  decoder_kv_heads=None, decoder_start_i=0,
                  emotion_input_size=768, emotion_hidden_sizes=[512, 384], emotion_dropout=0.1,
                  pretraining_mode=False, use_te=False, zero_shot_mode=False,
-                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False):
+                 lora_rank=0, lora_alpha=16, lora_dropout=0.0, lora_scale=1.0, use_macaron=False,
+                 use_canon_a=False, use_canon_c=False, canon_kernel_size=4):
         super(Echolancer, self).__init__()
         self.emotion_channels = emotion_channels
         self.speaker_channels = speaker_channels
@@ -1191,6 +1482,7 @@ class Echolancer(nn.Module):
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.lora_scale = lora_scale
+        self._is_export = False
 
         
         if self.emotion_channels > 0:
@@ -1227,6 +1519,9 @@ class Echolancer(nn.Module):
             lora_dropout=lora_dropout,
             lora_scale=lora_scale,
             use_macaron=use_macaron,
+            use_canon_a=use_canon_a,
+            use_canon_c=use_canon_c,
+            canon_kernel_size=canon_kernel_size,
         )
 
         self.combined_vocab_size = vocab_size + self.decoder.n_embeds # decoder adds special tokens.
@@ -1274,7 +1569,16 @@ class Echolancer(nn.Module):
 
         self.apply_xavier_uniform_init()
 
-    def forward(self, sequence, seq_lens, spk_ids=None, em_hidden=None):
+    @property
+    def is_export(self):
+        return self._is_export
+
+    @is_export.setter
+    def is_export(self, value):
+        self._is_export = value
+        self.decoder.is_export = value
+
+    def forward(self, sequence, seq_lens, spk_ids=None, em_hidden=None, kv_cache=None, cache_seqlens=None):
         """
         Forward pass of decoder-only Echolancer for concatenated sequences.
         
@@ -1285,8 +1589,11 @@ class Echolancer(nn.Module):
             spk_ids: Speaker IDs (B,) or speaker embeddings (B, speaker_channels) - optional
             em_hidden: Emotion embeddings (B, emotion_dim) - optional
             
+            kv_cache: Optional list of KV caches for transformer layers
+            cache_seqlens: Optional tensor of sequence lengths for KV cache
+            
         Returns:
-            Tuple of outputs for loss computation
+            Tuple of (logits, new_kv_cache, new_cache_seqlens)
         """
         B, T_total = sequence.size()
         
@@ -1299,11 +1606,11 @@ class Echolancer(nn.Module):
         x_mask = sequence_mask(T_total, seq_lens) if seq_lens is not None else None
 
 
-        logits = self.decoder(
-            sequence, x_mask, None, None, spk_emb=spk_emb,
+        logits, new_kv_cache, new_cache_seqlens = self.decoder(
+            sequence, x_mask, spk_emb=spk_emb, kv_cache=kv_cache, cache_seqlens=cache_seqlens
         )
 
-        return logits
+        return logits, new_kv_cache, new_cache_seqlens
 
     def embed_sequence(self, seq_lens, sequence):
         """
@@ -1519,3 +1826,135 @@ class Echolancer(nn.Module):
             if 'lora_A' not in name and 'lora_B' not in name:
                 non_lora_params.append(param)
         return non_lora_params
+
+
+class EcholancerONNX(nn.Module):
+    """
+    ONNX-exportable wrapper for Echolancer with flat KV cache tensors.
+    
+    This wrapper handles conversion between flat cache tensors (ONNX-friendly)
+    and the internal per-layer cache format.
+    
+    Cache shapes:
+        k_cache: (num_layers, B, max_len, num_kv_heads, d_k)
+        v_cache: (num_layers, B, max_len, num_kv_heads, d_k)
+        cache_len: (B,) - current sequence length in cache
+    
+    Usage:
+        # Wrap existing model
+        model_onnx = EcholancerONNX(model, max_len=2048)
+        model_onnx.eval()
+        
+        # Export to ONNX
+        torch.onnx.export(model_onnx, (tokens, k_cache, v_cache, cache_len, spk_emb), "model.onnx", ...)
+        
+        # At runtime, same function works for prefill (T > 1) and decode (T = 1)
+    """
+    
+    def __init__(self, model: Echolancer, max_len: int = 2048):
+        super().__init__()
+        self.model = model
+        self.max_len = max_len
+        
+        # Enable export mode (propagates to all attention layers)
+        self.model.is_export = True
+        
+        # Cache dimensions from model structure
+        decoder = self.model.decoder.dec
+        first_layer = decoder.layers[0]
+        self.num_layers = len(decoder.layers)
+        self.num_kv_heads = first_layer.self_attn.num_kv_heads
+        self.d_k = first_layer.self_attn.d_k
+    
+    def get_cache_shape(self, batch_size: int = 1):
+        """Returns the shape for k_cache and v_cache tensors."""
+        return (self.num_layers, batch_size, self.max_len, self.num_kv_heads, self.d_k)
+    
+    def create_cache(self, batch_size: int = 1, device='cpu', dtype=torch.float32):
+        """
+        Create empty cache tensors for initialization.
+        
+        Returns:
+            k_cache: (num_layers, B, max_len, num_kv_heads, d_k)
+            v_cache: (num_layers, B, max_len, num_kv_heads, d_k)
+            cache_len: (B,)
+        """
+        shape = self.get_cache_shape(batch_size)
+        k_cache = torch.zeros(shape, device=device, dtype=dtype)
+        v_cache = torch.zeros(shape, device=device, dtype=dtype)
+        cache_len = torch.zeros(batch_size, device=device, dtype=torch.int32)
+        return k_cache, v_cache, cache_len
+    
+    def forward(
+        self,
+        tokens,      # (B, T) - input token IDs
+        k_cache,     # (num_layers, B, max_len, num_kv_heads, d_k)
+        v_cache,     # (num_layers, B, max_len, num_kv_heads, d_k)
+        cache_len,   # (B,) - current position in cache
+        spk_id=None  # (B,) speaker ID for multi-speaker, or (B, 1, speaker_channels) embedding for zero-shot
+    ):
+        """
+        Unified forward for both prefill and decode.
+        
+        Args:
+            tokens: Token IDs (B, T) - T can be any length
+            k_cache: Key cache (num_layers, B, max_len, num_kv_heads, d_k)
+            v_cache: Value cache (num_layers, B, max_len, num_kv_heads, d_k)
+            cache_len: Current cache length per batch (B,)
+            spk_id: Speaker input. For multi-speaker models with fixed embeddings,
+                    pass speaker ID (B,) which will be looked up via the embedding table.
+                    For zero-shot mode, pass speaker embedding (B, 1, speaker_channels) directly.
+            
+        Returns:
+            logits: (B, T, vocab_size)
+            k_cache: Updated key cache (same shape as input)
+            v_cache: Updated value cache (same shape as input)
+            cache_len: Updated cache length (B,)
+        """
+        B, T = tokens.size()
+        device = tokens.device
+        dtype = k_cache.dtype
+        
+        # Handle speaker conditioning
+        # If model has speaker embedding table and input is 1D, look up the embedding
+        if self.model.speaker_emb is not None and spk_id is not None:
+            if spk_id.dim() == 1:
+                # spk_id is (B,) - look up embedding
+                spk_cond = self.model.speaker_emb(spk_id).view(B, 1, -1)  # (B, 1, speaker_channels)
+                spk_cond = self.model.spk_norm(spk_cond)
+            else:
+                # Already an embedding tensor
+                spk_cond = spk_id
+        elif spk_id is not None:
+            # Zero-shot mode or direct embedding input
+            spk_cond = spk_id
+        else:
+            spk_cond = None
+        
+        # Convert flat caches to per-layer list format
+        # Each layer expects: (k, v) where k, v are (B, max_len, num_kv_heads, d_k)
+        kv_caches = []
+        for layer_idx in range(self.num_layers):
+            k_layer = k_cache[layer_idx]  # (B, max_len, num_kv_heads, d_k)
+            v_layer = v_cache[layer_idx]  # (B, max_len, num_kv_heads, d_k)
+            kv_caches.append((k_layer, v_layer))
+        
+        # Create sequence lengths (all tokens are valid, no padding during inference)
+        seq_lens = cache_len + T
+        
+        # Call the model's forward with KV cache
+        logits, new_kv_caches, new_cache_len = self.model(
+            tokens, 
+            seq_lens=None,  # No padding mask needed for inference
+            spk_ids=spk_cond,  # Pass processed speaker conditioning
+            em_hidden=None,
+            kv_cache=kv_caches,
+            cache_seqlens=cache_len
+        )
+        
+        # Convert per-layer caches back to flat tensors
+        # Stack along layer dimension
+        new_k_cache = torch.stack([kv[0] for kv in new_kv_caches], dim=0)
+        new_v_cache = torch.stack([kv[1] for kv in new_kv_caches], dim=0)
+        
+        return logits, new_k_cache, new_v_cache, new_cache_len

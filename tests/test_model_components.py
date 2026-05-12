@@ -14,7 +14,7 @@ from model.echolancer import (
     Echolancer, MultiHeadAttention, FeedForward,
     TransformerEncoderLayer, TransformerDecoderLayer,
     TextEncoder, AudioDecoderAR,
-    expand_self_attention_mask, expand_masks2
+    expand_self_attention_mask, expand_masks2, CanonLayer
 )
 from model.loss import EcholancerLoss
 
@@ -44,6 +44,81 @@ class TestModelComponents(unittest.TestCase):
             'alibi_alpha': 1.0,
             'activation': 'relu'
         }
+
+    def test_canon_layer_zero_initialized_branch(self):
+        """Canon starts as a no-op branch and preserves input shape."""
+        layer = CanonLayer(dim=8, kernel_size=4).to(self.device)
+        x = torch.randn(2, 6, 8, device=self.device)
+
+        output = layer(x)
+
+        self.assertEqual(output.shape, x.shape)
+        self.assertTrue(torch.allclose(output, torch.zeros_like(output)))
+
+    def test_canon_layer_masking(self):
+        """Canon masks padded positions before and after convolution."""
+        layer = CanonLayer(dim=4, kernel_size=3).to(self.device)
+        with torch.no_grad():
+            layer.conv.weight.fill_(1.0)
+
+        x = torch.ones(1, 5, 4, device=self.device)
+        mask = torch.tensor([[False, False, False, True, True]], device=self.device)
+
+        output = layer(x, mask=mask)
+
+        self.assertTrue(torch.allclose(output[:, 3:, :], torch.zeros_like(output[:, 3:, :])))
+
+    def test_canon_layer_is_causal(self):
+        """Future token changes do not affect earlier Canon outputs."""
+        layer = CanonLayer(dim=3, kernel_size=4).to(self.device)
+        with torch.no_grad():
+            layer.conv.weight.fill_(1.0)
+
+        x = torch.randn(1, 6, 3, device=self.device)
+        changed_future = x.clone()
+        changed_future[:, 5, :] = changed_future[:, 5, :] + 100.0
+
+        output = layer(x)
+        changed_output = layer(changed_future)
+
+        self.assertTrue(torch.allclose(output[:, :5, :], changed_output[:, :5, :]))
+
+    def test_decoder_canon_zero_init_matches_disabled(self):
+        """Enabled Canon is initially equivalent to disabled Canon."""
+        torch.manual_seed(1234)
+        disabled = TransformerDecoderLayer(
+            d_model=32,
+            num_heads=4,
+            d_ff=64,
+            dropout=0.0,
+            disable_cross_attn=True,
+            use_canon_a=False,
+            use_canon_c=False,
+        ).to(self.device)
+
+        torch.manual_seed(5678)
+        enabled = TransformerDecoderLayer(
+            d_model=32,
+            num_heads=4,
+            d_ff=64,
+            dropout=0.0,
+            disable_cross_attn=True,
+            use_canon_a=True,
+            use_canon_c=True,
+            canon_kernel_size=4,
+        ).to(self.device)
+        enabled.load_state_dict(disabled.state_dict(), strict=False)
+        disabled.eval()
+        enabled.eval()
+
+        x = torch.randn(2, 7, 32, device=self.device)
+        ffn_seq_mask = torch.zeros(2, 7, dtype=torch.bool, device=self.device)
+
+        with torch.no_grad():
+            disabled_output, _, _ = disabled(x, None, None, None, None, ffn_seq_mask)
+            enabled_output, _, _ = enabled(x, None, None, None, None, ffn_seq_mask)
+
+        self.assertTrue(torch.allclose(disabled_output, enabled_output, atol=1e-6))
     
     def test_multihead_attention(self):
         """Test MultiHeadAttention with ALiBi support."""

@@ -9,7 +9,8 @@ def get_model(vocab_size, encoder_hidden=256, encoder_head=4, encoder_layer=4,
               use_alibi=False, alibi_alpha=1.0, activation='relu',
               vq_token_mode=False, vq_vocab_size=1024,
               encoder_kv_heads=None, decoder_kv_heads=None,
-              emotion_input_size=768, emotion_hidden_sizes=[512, 384], emotion_dropout=0.1):
+              emotion_input_size=768, emotion_hidden_sizes=[512, 384], emotion_dropout=0.1,
+              use_canon_a=False, use_canon_c=False, canon_kernel_size=4):
     """
     Create an Echolancer model with specified parameters.
     """
@@ -44,7 +45,10 @@ def get_model(vocab_size, encoder_hidden=256, encoder_head=4, encoder_layer=4,
         decoder_kv_heads=decoder_kv_heads,
         emotion_input_size=emotion_input_size,
         emotion_hidden_sizes=emotion_hidden_sizes,
-        emotion_dropout=emotion_dropout
+        emotion_dropout=emotion_dropout,
+        use_canon_a=use_canon_a,
+        use_canon_c=use_canon_c,
+        canon_kernel_size=canon_kernel_size
     )
     return model
 
