@@ -37,6 +37,8 @@ except ImportError:
     TRANSFORMER_ENGINE_AVAILABLE = False
     print("Transformer Engine not available.")
 
+KV_CACHE_NOT_PROVIDED = object()
+
 
 class LoRALayer(nn.Module):
     """
@@ -576,11 +578,11 @@ class MultiHeadAttention(nn.Module):
         bias = slopes * (k_idx - q_idx)  # (1,H,Tq,Tk), typically <= 0 on/left of diagonal
         return bias  # fp32
 
-    def forward(self, query, key, value, mask=None, kv_cache="NOT_PROVIDED", cache_seqlens="NOT_PROVIDED"):
-        if kv_cache != "NOT_PROVIDED" or cache_seqlens != "NOT_PROVIDED":
+    def forward(self, query, key, value, mask=None, kv_cache=KV_CACHE_NOT_PROVIDED, cache_seqlens=KV_CACHE_NOT_PROVIDED):
+        if kv_cache is not KV_CACHE_NOT_PROVIDED or cache_seqlens is not KV_CACHE_NOT_PROVIDED:
             # Call forward_with_kvcache if either was provided
-            real_kv_cache = None if kv_cache == "NOT_PROVIDED" else kv_cache
-            real_cache_seqlens = None if cache_seqlens == "NOT_PROVIDED" else cache_seqlens
+            real_kv_cache = None if kv_cache is KV_CACHE_NOT_PROVIDED else kv_cache
+            real_cache_seqlens = None if cache_seqlens is KV_CACHE_NOT_PROVIDED else cache_seqlens
             return self.forward_with_kvcache(query, key=key, value=value, kv_cache=real_kv_cache, cache_seqlens=real_cache_seqlens)
 
         batch_size = query.size(0)
@@ -1066,7 +1068,8 @@ class TransformerDecoderLayer(nn.Module):
         if hasattr(self.cross_attn, 'is_export'):
             self.cross_attn.is_export = value
 
-    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask, kv_cache=None, cache_seqlens=None):
+    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask,
+                kv_cache=KV_CACHE_NOT_PROVIDED, cache_seqlens=KV_CACHE_NOT_PROVIDED):
         # 1. Self-attention (pre-norm)
         residual = x
         
@@ -1084,7 +1087,14 @@ class TransformerDecoderLayer(nn.Module):
         if self.disable_cross_attn:  # keep the bug-fix comment #1
             self_attn_mask = None
 
-        x, new_kv_cache, new_cache_seqlens = self.self_attn(normed, normed, normed, self_attn_mask, kv_cache=kv_cache, cache_seqlens=cache_seqlens)
+        if kv_cache is KV_CACHE_NOT_PROVIDED and cache_seqlens is KV_CACHE_NOT_PROVIDED:
+            x, new_kv_cache, new_cache_seqlens = self.self_attn(normed, normed, normed, self_attn_mask)
+        else:
+            x, new_kv_cache, new_cache_seqlens = self.self_attn(
+                normed, normed, normed, self_attn_mask,
+                kv_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+            )
         x = residual + x
 
         # 2. Cross-attention (pre-norm)
@@ -1158,15 +1168,25 @@ class TransformerDecoder(nn.Module):
         for layer in self.layers:
             layer.is_export = value
 
-    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask=None, ffn_seq_mask=None, kv_caches=None, cache_seqlens=None):
+    def forward(self, x, memory, cond, self_attn_mask, cross_attn_mask=None, ffn_seq_mask=None,
+                kv_caches=KV_CACHE_NOT_PROVIDED, cache_seqlens=KV_CACHE_NOT_PROVIDED):
         new_kv_caches = []
-        new_seqlens = cache_seqlens 
+        new_seqlens = None if cache_seqlens is KV_CACHE_NOT_PROVIDED else cache_seqlens
+        use_kv_cache = kv_caches is not KV_CACHE_NOT_PROVIDED or cache_seqlens is not KV_CACHE_NOT_PROVIDED
         
         for i, layer in enumerate(self.layers):
-            layer_kv_cache = kv_caches[i] if kv_caches is not None else None
-            # Pass original cache_seqlens to each layer, but collect outputs
-            x, new_cache, layer_new_seqlens = layer(x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask, 
-                                               kv_cache=layer_kv_cache, cache_seqlens=cache_seqlens)
+            if use_kv_cache:
+                layer_kv_cache = kv_caches[i] if kv_caches is not None and kv_caches is not KV_CACHE_NOT_PROVIDED else None
+                # Pass original cache_seqlens to each layer, but collect outputs
+                x, new_cache, layer_new_seqlens = layer(
+                    x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask,
+                    kv_cache=layer_kv_cache,
+                    cache_seqlens=cache_seqlens,
+                )
+            else:
+                x, new_cache, layer_new_seqlens = layer(
+                    x, memory, cond, self_attn_mask, cross_attn_mask, ffn_seq_mask,
+                )
             new_kv_caches.append(new_cache)
             new_seqlens = layer_new_seqlens
             
@@ -1287,7 +1307,8 @@ class AudioDecoderAR(nn.Module):
         self._is_export = value
         self.dec.is_export = value
 
-    def forward(self, x, x_mask, y=None, y_mask=None, spk_emb=None, kv_cache=None, cache_seqlens=None):
+    def forward(self, x, x_mask, y=None, y_mask=None, spk_emb=None,
+                kv_cache=KV_CACHE_NOT_PROVIDED, cache_seqlens=KV_CACHE_NOT_PROVIDED):
         """
         Autoregressive next-token prediction for discrete token generation.
         
@@ -1320,8 +1341,14 @@ class AudioDecoderAR(nn.Module):
 
         # Decoder forward pass
         if self.decoder_type == "transformer":
-            dec_out, new_kv_cache, new_cache_seqlens = self.dec(x, None, spk_emb, self_attn_mask, None, 
-                                                               kv_caches=kv_cache, cache_seqlens=cache_seqlens)
+            if kv_cache is KV_CACHE_NOT_PROVIDED and cache_seqlens is KV_CACHE_NOT_PROVIDED:
+                dec_out, new_kv_cache, new_cache_seqlens = self.dec(x, None, spk_emb, self_attn_mask, None)
+            else:
+                dec_out, new_kv_cache, new_cache_seqlens = self.dec(
+                    x, None, spk_emb, self_attn_mask, None,
+                    kv_caches=kv_cache,
+                    cache_seqlens=cache_seqlens,
+                )
             
             # Final projection
             indices_pred = self.out_proj(dec_out)  # (B, L-1, vocab_size)
@@ -1372,6 +1399,8 @@ class AudioDecoderAR(nn.Module):
             # Run forward pass without encoder input (y and y_mask are None in pretraining mode)
             indices_pred = self.forward(
                 decoder_input, x_mask, None, None, spk_emb=spk_emb)
+            if isinstance(indices_pred, tuple):
+                indices_pred = indices_pred[0]
 
             # Get the logits for the last token.
             logits = indices_pred[:, -1, :]  # (B, vocab_size)
@@ -1578,7 +1607,8 @@ class Echolancer(nn.Module):
         self._is_export = value
         self.decoder.is_export = value
 
-    def forward(self, sequence, seq_lens, spk_ids=None, em_hidden=None, kv_cache=None, cache_seqlens=None):
+    def forward(self, sequence, seq_lens, spk_ids=None, em_hidden=None,
+                kv_cache=KV_CACHE_NOT_PROVIDED, cache_seqlens=KV_CACHE_NOT_PROVIDED):
         """
         Forward pass of decoder-only Echolancer for concatenated sequences.
         
@@ -1606,9 +1636,16 @@ class Echolancer(nn.Module):
         x_mask = sequence_mask(T_total, seq_lens) if seq_lens is not None else None
 
 
-        logits, new_kv_cache, new_cache_seqlens = self.decoder(
-            sequence, x_mask, spk_emb=spk_emb, kv_cache=kv_cache, cache_seqlens=cache_seqlens
-        )
+        if kv_cache is KV_CACHE_NOT_PROVIDED and cache_seqlens is KV_CACHE_NOT_PROVIDED:
+            logits, new_kv_cache, new_cache_seqlens = self.decoder(sequence, x_mask, spk_emb=spk_emb)
+        else:
+            logits, new_kv_cache, new_cache_seqlens = self.decoder(
+                sequence,
+                x_mask,
+                spk_emb=spk_emb,
+                kv_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+            )
 
         return logits, new_kv_cache, new_cache_seqlens
 

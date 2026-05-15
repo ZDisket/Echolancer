@@ -53,8 +53,13 @@ class TTSPairedVQConcatDataset(Dataset):
         self.ddp_rank = ddp_rank
         self.ddp_world_size = ddp_world_size
         
-        # Check if we're in DDP mode
-        self.is_ddp = (ddp_rank is not None and ddp_world_size is not None)
+        # Check if we're in DDP mode. Single-process training passes
+        # rank=0/world_size=1 but does not initialize torch.distributed.
+        self.is_ddp = (
+            ddp_rank is not None
+            and ddp_world_size is not None
+            and ddp_world_size > 1
+        )
         
         if self.is_ddp and ddp_rank == 0:
             print(f"Dataset vocab offset for VQ tokens: {self.vocab_offset}")
@@ -91,6 +96,8 @@ class TTSPairedVQConcatDataset(Dataset):
         # (when preloading, it's broadcast as part of metadata inside the preload block)
         if self.is_ddp and not preload:
             import torch.distributed as dist
+            if not dist.is_initialized():
+                raise RuntimeError("DDP dataset requested before torch.distributed was initialized")
             metadata = [self.items_per_shard]
             dist.broadcast_object_list(metadata, src=0)
             if ddp_rank != 0:
@@ -100,6 +107,8 @@ class TTSPairedVQConcatDataset(Dataset):
             if self.is_ddp:
                 # DDP mode: only rank 0 loads, then broadcasts
                 import torch.distributed as dist
+                if not dist.is_initialized():
+                    raise RuntimeError("DDP dataset requested before torch.distributed was initialized")
                 
                 if ddp_rank == 0:
                     print("[Rank 0] Loading dataset from disk...")

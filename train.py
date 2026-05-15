@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 torch.backends.cuda.enable_cudagraph_trees = False
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -147,6 +147,13 @@ def get_model(model):
         model_unwrapped = model_unwrapped._orig_mod
         
     return model_unwrapped
+
+
+def get_logits(model_output):
+    """Return logits from models that may also return cache state."""
+    if isinstance(model_output, tuple):
+        return model_output[0]
+    return model_output
 
 
 
@@ -528,7 +535,7 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
             # Forward pass for the model
             with autocast_ctx():
                 torch.compiler.cudagraph_mark_step_begin()
-                decoder_logits = model(decoder_input, sequence_lengths, speakers, None)
+                decoder_logits = get_logits(model(decoder_input, sequence_lengths, speakers, None))
 
             # Calculate decoder loss - predict the next token in sequence
             total_ce_loss, text_loss, audio_loss = cross_entropy_text_audio(
@@ -663,13 +670,6 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
             torch.cuda.empty_cache()
 
 
-        # Perform testing if interval is set and current step matches the test interval (only on main process)
-        if config.test_interval_steps > 0 and current_global_step % config.test_interval_steps == 0 and is_main_process():
-            print_rank0(f"Generating audio test samples at step {current_global_step}")
-            test_output_dir = os.path.join(config.output_dir, f"test_audio_step_{current_global_step}")
-            generate_audio_test(model, config, text_tokenizer, wandb_logger, current_global_step)
-            torch.cuda.empty_cache()
-
         # Save checkpoint every save_interval_steps (only on main process)
         if config.save_interval_steps > 0 and current_global_step % config.save_interval_steps == 0 and is_main_process():
             checkpoint_path = os.path.join(config.output_dir, f"checkpoint_step_{current_global_step}.pt")
@@ -700,6 +700,13 @@ def train_epoch(model, dataloader, optimizer, config, global_step, text_tokenize
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, checkpoint_path)
             print_rank0(f"Checkpoint saved to {checkpoint_path}")
+
+        # Perform testing if interval is set and current step matches the test interval (only on main process)
+        if config.test_interval_steps > 0 and current_global_step % config.test_interval_steps == 0 and is_main_process():
+            print_rank0(f"Generating audio test samples at step {current_global_step}")
+            test_output_dir = os.path.join(config.output_dir, f"test_audio_step_{current_global_step}")
+            generate_audio_test(model, config, text_tokenizer, wandb_logger, current_global_step)
+            torch.cuda.empty_cache()
     
     if epoch_pbar is not None:
         epoch_pbar.close()
@@ -852,7 +859,7 @@ def validate(model, dataloader, config, autocast_ctx=None, wandb_logger=None, st
 
                 # Forward pass for the model
                 with autocast_ctx():
-                    decoder_logits = model(decoder_input, sequence_lengths, speakers, None)
+                    decoder_logits = get_logits(model(decoder_input, sequence_lengths, speakers, None))
 
                 # Calculate decoder loss - predict the next token in sequence
                 total_ce_loss, text_loss, audio_loss = cross_entropy_text_audio(
@@ -1203,6 +1210,10 @@ def main():
     
     parser.add_argument("--load_checkpoint", action="store_true",
                         help="Load the latest checkpoint from the output folder and continue training")
+    parser.add_argument("--wandb_name", type=str, default=None,
+                        help="Override the Weights & Biases run name")
+    parser.add_argument("--wandb_group", type=str, default=None,
+                        help="Override the Weights & Biases run group")
 
     args = parser.parse_args()
 
@@ -1242,7 +1253,13 @@ def main():
     # Initialize Weights & Biases logging (only on main process)
     wandb_logger = None
     if is_main_process():
-        train_config['wandb']['name'] = f"echolancer-pretrainv2-{int(time.time())}"
+        train_config.setdefault('wandb', {})
+        if args.wandb_name is not None:
+            train_config['wandb']['name'] = args.wandb_name
+        elif not train_config['wandb'].get('name'):
+            train_config['wandb']['name'] = f"echolancer-pretrainv2-{int(time.time())}"
+        if args.wandb_group is not None:
+            train_config['wandb']['group'] = args.wandb_group
         wandb_logger = WandbLogger(train_config)
 
     # Initialize training configuration object
